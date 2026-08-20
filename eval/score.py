@@ -11,6 +11,7 @@ You can edit this file to add custom evals or adjust weights.
 Once edited, it becomes a Tier 1 (explicit) eval — the factory will use it as-is.
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -424,11 +425,45 @@ def eval_accuracy() -> dict:
     return _accuracy_result(score, complete and score > 0.0, details)
 
 
-# Register all eval functions here.
-EVALS = [eval_tests, eval_lint, eval_coverage, eval_observability, eval_accuracy]
+# Every eval dimension, keyed by name. `--dimension <name>` runs exactly one of
+# these and prints its dict (which already carries top-level `score`/`details`)
+# so the factory runner can read the metric directly.
+_DIMENSIONS = {
+    "tests": eval_tests,
+    "lint": eval_lint,
+    "coverage": eval_coverage,
+    "observability": eval_observability,
+    "accuracy": eval_accuracy,
+}
+
+# The bare-bundle evals (no args) deliberately EXCLUDE `accuracy`: it drives an
+# expensive GPU benchmark and is scored on its own via `--dimension accuracy`,
+# so the default `{"results": [...]}` bundle stays cheap and never triggers a
+# GPU run.
+EVALS = [eval_tests, eval_lint, eval_coverage, eval_observability]
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run Software Factory eval dimensions and emit JSON to stdout.",
+    )
+    parser.add_argument(
+        "--dimension",
+        choices=sorted(_DIMENSIONS),
+        help=(
+            "Run a single eval dimension and print its dict with top-level "
+            "'score'/'details' keys. Omit to print the bare bundle "
+            "(excludes 'accuracy', so no GPU run)."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.dimension:
+        result = _DIMENSIONS[args.dimension]()
+        json.dump(result, sys.stdout, indent=2)
+        print()  # trailing newline
+        return
+
     results = [fn() for fn in EVALS]
     output = {"results": results}
     json.dump(output, sys.stdout, indent=2)

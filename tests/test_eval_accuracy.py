@@ -7,7 +7,10 @@ contract.
 """
 
 import importlib.util
+import json
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -72,5 +75,56 @@ def test_allowed_budget_values():
     assert {4, 8} == score._ALLOWED_BUDGETS
 
 
-def test_eval_accuracy_registered():
-    assert score.eval_accuracy in score.EVALS
+def test_accuracy_excluded_from_bare_bundle():
+    # The expensive GPU accuracy benchmark must NOT run in the default bundle;
+    # it is scored on its own via `--dimension accuracy`.
+    assert score.eval_accuracy not in score.EVALS
+
+
+def test_accuracy_in_dimension_registry():
+    assert score._DIMENSIONS["accuracy"] is score.eval_accuracy
+
+
+def _run_score(args, env=None):
+    """Invoke eval/score.py as a subprocess (as the factory runner does)."""
+    run_env = dict(os.environ)
+    # Never let an ambient endpoint turn this into a live GPU run.
+    run_env.pop("ITS_ENDPOINT", None)
+    run_env.pop("OPENAI_ENDPOINT", None)
+    if env:
+        run_env.update(env)
+    return subprocess.run(
+        [sys.executable, _SCORE_PATH, *args],
+        capture_output=True,
+        text=True,
+        env=run_env,
+        cwd=_REPO_ROOT,
+        timeout=120,
+    )
+
+
+def test_dimension_accuracy_no_endpoint_emits_top_level_score():
+    # `--dimension accuracy` with no endpoint must print a JSON object with a
+    # top-level float 'score' == 0.0 and a string 'details', and must not raise.
+    proc = _run_score(["--dimension", "accuracy"])
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert isinstance(data["score"], float)
+    assert data["score"] == 0.0
+    assert isinstance(data["details"], str)
+    assert data["details"]
+    assert data["name"] == "accuracy"
+
+
+def test_bare_bundle_excludes_accuracy():
+    # The bare bundle (`python eval/score.py`, no args) prints {"results": [...]}
+    # and must NOT contain an 'accuracy' entry — accuracy is scored on its own
+    # via `--dimension accuracy` so the default bundle never triggers a GPU run.
+    # Checked in-process against the real EVALS list (mapped to dimension names
+    # through the registry) so this stays fast: actually shelling out to the
+    # bundle would run the full pytest suite twice via eval_tests/eval_coverage.
+    name_by_fn = {fn: name for name, fn in score._DIMENSIONS.items()}
+    bundle_names = {name_by_fn[fn] for fn in score.EVALS}
+    assert "accuracy" not in bundle_names
+    # Other dimensions remain in the default bundle.
+    assert {"tests", "lint", "coverage", "observability"} <= bundle_names

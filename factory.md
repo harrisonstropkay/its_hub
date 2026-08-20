@@ -15,7 +15,7 @@ python eval/score.py
 ## Project Eval
 
 - name: accuracy
-  command: python eval/score.py
+  command: python eval/score.py --dimension accuracy
   parse: json
   weight: 1.0
   timeout: 1200
