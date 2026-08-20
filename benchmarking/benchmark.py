@@ -33,7 +33,6 @@ from its_hub.core.utils import (
 
 if TYPE_CHECKING:  # only for type annotations — kept lazy at runtime
     import pandas as pd
-    from reward_hub.base import AggregationMethod
 
 
 class BenchmarkDataset(Enum):
@@ -215,18 +214,27 @@ def init_algorithm(
     model_name: str,
     rm_name: str,
     rm_device: str,
-    rm_agg_method: AggregationMethod,
+    rm_agg_method: str,
     tokens_per_step: int | None = None,
 ):
-    # Imported lazily: reward_hub / vLLM are only needed for the PRM-based
-    # (beam-search / particle-filtering) algorithms.
+    if alg == ScalingAlgorithm.SELF_CONSISTENCY:
+        # Self-consistency uses no reward model, so return before importing
+        # anything that pulls in reward_hub / vLLM (the ``experimental`` extra).
+        return SelfConsistency(_extract_boxed)
+
+    # PRM-based algorithms below. reward_hub / vLLM are imported lazily here so
+    # the self-consistency path above stays importable without the experimental
+    # extra. ``rm_agg_method`` arrives as a raw string and is resolved to a
+    # reward_hub ``AggregationMethod`` only now that we know a PRM is needed.
+    from reward_hub.base import AggregationMethod
+
     from its_hub.core.reward_models.local_vllm_prm import (
         LocalVllmProcessRewardModel,
     )
 
-    if alg == ScalingAlgorithm.SELF_CONSISTENCY:
-        return SelfConsistency(_extract_boxed)
-    elif alg == ScalingAlgorithm.BEAM_SEARCH:
+    rm_agg_method = AggregationMethod(rm_agg_method)
+
+    if alg == ScalingAlgorithm.BEAM_SEARCH:
         if tokens_per_step is not None:
             # Use new tokens_per_step approach for easier usage
             sg = StepGeneration(
@@ -341,10 +349,12 @@ def display_results(df: pd.DataFrame):
     "--rm_agg_method",
     type=str,
     default="model",
-    # Parsed lazily so importing this module doesn't require reward_hub.
-    callback=lambda ctx, param, value: __import__(
-        "reward_hub.base", fromlist=["AggregationMethod"]
-    ).AggregationMethod(value),
+    # Kept as a raw string at parse time and only converted to a reward_hub
+    # ``AggregationMethod`` at point of use (inside ``init_algorithm``, for the
+    # PRM-based algorithms). Click runs option callbacks even on default values,
+    # so importing reward_hub in a callback here would crash arg-parsing on boxes
+    # without the ``experimental`` extra — even for self-consistency, which never
+    # touches a reward model.
     help="aggregation method to use for reward model (from reward_hub AggregationMethod)",
 )
 @click.option(
@@ -408,7 +418,7 @@ def main(
     api_key: str,
     rm_name: str,
     rm_device: str,
-    rm_agg_method: AggregationMethod,
+    rm_agg_method: str,
     alg: ScalingAlgorithm,
     subset: str,
     budgets: list,
@@ -443,7 +453,7 @@ def main(
         or alg == ScalingAlgorithm.ENTROPIC_PARTICLE_FILTERING
     ):
         rm_name_dashed = rm_name.replace("/", "-")
-        alg_str = f"{alg.value}-{rm_name_dashed}-{rm_agg_method.value}"
+        alg_str = f"{alg.value}-{rm_name_dashed}-{rm_agg_method}"
         # Add tokens_per_step to filename if specified
         if tokens_per_step is not None:
             alg_str += f"-tokens{tokens_per_step}"
