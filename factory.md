@@ -4,33 +4,37 @@ This file is the governance contract for the Software Factory's design-mode loop
 `its_hub`. It declares what the loop optimizes, how it is scored, what it may edit,
 and what would count as cheating. Read it before running any research cycle.
 
+## Goal
+
+Raise composite math (MATH500, AIME-2024) + hard-science (GPQA-Diamond) accuracy by improving its_hub inference-time scaling, no human in the loop.
+
+## Command
+
+python eval/score.py
+
 ## Project Eval
 
-- **Metric:** `accuracy` (composite math + hard-science benchmark accuracy)
-- **Command:** `python eval/score.py`
-- **Parser:** `json` — the command prints `{"results": [{name, score, weight, passed, details}, ...]}`;
-  the project metric is the entry with `"name": "accuracy"`.
-- **Definition:** `score = clamp(0.5 * mean(MATH500_acc, AIME_2024_acc) + 0.5 * GPQA_Diamond_acc, 0, 1)` —
-  math and science are weighted equally so the loop cannot win on math alone.
-- **Cost discipline:** fixed per-experiment budget (`ITS_BUDGET` ∈ {4, 8}, default 4) and a hard
-  per-benchmark wall-clock cap (`ITS_EVAL_TIMEOUT`, default 1200s). The eval degrades to
-  `score=0.0, passed=False` (never raises) when no model endpoint is reachable.
+- name: accuracy
+  command: python eval/score.py
+  parse: json
+  weight: 1.0
+  timeout: 1200
+  description: composite math+science benchmark accuracy (0.5*mean(math500,aime) + 0.5*gpqa)
 
 ## Eval Weights
 
-- **project:** 0.50  (the `accuracy` metric above — project-dominant)
-- **hygiene:** 0.30  (tests, lint, coverage)
-- **growth:**  0.20  (capability surface / observability)
+- project: 0.50
+- hygiene: 0.30
+- growth: 0.20
 
 ## Research Target
 
-- **Objective:** raise math (MATH500, AIME-2024) and hard-science (GPQA-Diamond) accuracy by
-  improving *how* `its_hub` scales inference — its prompts, sampling, step configuration, and
-  scaling algorithms — with no human in the loop.
-- **Metric:** `accuracy` (see Project Eval).
-- **Run command:** `python eval/score.py`
-- **Model:** `Qwen/Qwen2.5-Math-7B-Instruct`, fixed for every experiment, served by vLLM
-  (data-parallel across all available GPUs) at the endpoint named by `ITS_ENDPOINT`.
+- objective: raise math (MATH500, AIME-2024) and hard-science (GPQA-Diamond) accuracy by improving how its_hub scales inference
+- metric: accuracy
+- run_command: python eval/score.py
+- result_path: results/score.json
+- target: 0.0
+- timeout: 3600
 
 ## Mutable Surfaces
 
@@ -87,5 +91,5 @@ Before keeping any change, inspect the diff and **revert** if the agent:
 
 ## Hypothesis Budget
 
-- **min_growth:** 1   — each cycle must attempt at least one genuine capability/algorithm change.
-- **max_new:** 3      — cap new hypotheses per cycle so iteration stays disciplined and cheap.
+- min_growth: 1
+- max_new: 3
