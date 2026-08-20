@@ -12,8 +12,10 @@ Once edited, it becomes a Tier 1 (explicit) eval — the factory will use it as-
 """
 
 import json
+import os
 import subprocess
 import sys
+
 
 def eval_tests() -> dict:
     """Run test suite: uv run pytest -v"""
@@ -198,8 +200,232 @@ def eval_observability() -> dict:
     return {"name": "observability", "score": round(score, 3), "weight": 0.10,
             "passed": score >= 0.3, "details": details}
 
+# --- Project eval: composite math + science accuracy ------------------------
+#
+# Disjoint dev/test subsets per benchmark (so the research loop never tunes on
+# the scored items). Only the *test* slices below are scored here; the *dev*
+# slices are reserved for the loop to iterate against:
+#
+#     benchmark      test slice   dev slice (reserved for the loop)
+#     -----------    ----------   ---------------------------------
+#     MATH500        ':20'        '20:60'
+#     GPQA-Diamond   ':20'        '20:60'
+#     AIME-2024      ':15'        '15:30'   (AIME-2024 has only 30 items)
+#
+# The scoring path drives benchmarking/benchmark.py at the *subprocess* boundary
+# so it never imports algorithm-editable code — closing the classic leakage
+# channel. benchmarking/** and this scoring path are FIXED surfaces during the
+# research loop (see factory.md).
+
+_ACCURACY_WEIGHT = 0.50
+_ALLOWED_BUDGETS = {4, 8}
+_DEFAULT_TIMEOUT = 1200  # seconds, per benchmark subprocess
+
+# (benchmark CLI value, held-out TEST subset)
+_ACCURACY_BENCHMARKS = [
+    ("math500", ":20"),
+    ("aime-2024", ":15"),
+    ("gpqa-diamond", ":20"),
+]
+
+
+def _accuracy_result(score: float, passed: bool, details: str) -> dict:
+    return {
+        "name": "accuracy",
+        "score": round(float(score), 4),
+        "weight": _ACCURACY_WEIGHT,
+        "passed": bool(passed),
+        "details": details,
+    }
+
+
+def _endpoint_reachable(endpoint: str) -> bool:
+    """Best-effort check that an OpenAI-compatible endpoint is up. Never raises."""
+    import urllib.error
+    import urllib.request
+
+    url = endpoint.rstrip("/") + "/models"
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer NO_API_KEY"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status < 500
+    except urllib.error.HTTPError:
+        # The server responded (e.g. 401/404) — it is reachable.
+        return True
+    except Exception:
+        return False
+
+
+def _accuracy_from_jsonl(path: str, budget: int) -> float | None:
+    """Mean of the `correct` column for `budget` rows in a benchmark jsonl.
+
+    Returns None when the file has no usable rows (parsed manually to avoid a
+    pandas dependency in the scoring path)."""
+    scores = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if row.get("budget") != budget:
+                    continue
+                c = row.get("correct")
+                if c is None:
+                    continue
+                scores.append(float(c))
+    except (OSError, ValueError):
+        return None
+    if not scores:
+        return None
+    return sum(scores) / len(scores)
+
+
+def eval_accuracy() -> dict:
+    """Composite math + science accuracy via the benchmark harness.
+
+    score = clamp(0.5 * mean(MATH500_acc, AIME_acc) + 0.5 * GPQA_acc, 0, 1)
+
+    Configuration (all optional):
+      ITS_ENDPOINT / OPENAI_ENDPOINT  OpenAI-compatible base url (required to run)
+      ITS_MODEL                       model name (default Qwen/Qwen2.5-Math-7B-Instruct)
+      ITS_API_KEY / OPENAI_API_KEY    api key (default NO_API_KEY)
+      ITS_ALG                         scaling algorithm (default self-consistency)
+      ITS_BUDGET                      per-experiment budget, must be in {4, 8} (default 4)
+      ITS_EVAL_TIMEOUT                hard per-benchmark wall-clock cap (default 1200s)
+      ITS_TOKENS_PER_STEP             optional fixed tokens-per-step for step algorithms
+
+    Graceful degradation: if no endpoint is set/reachable, returns score=0.0,
+    passed=False with clear details and NEVER raises. A TimeoutExpired on any
+    benchmark yields a partial score with the timeout noted in details.
+    """
+    endpoint = os.environ.get("ITS_ENDPOINT") or os.environ.get("OPENAI_ENDPOINT")
+    if not endpoint:
+        return _accuracy_result(
+            0.0, False, "no model endpoint reachable — set ITS_ENDPOINT"
+        )
+
+    # Fixed budget allowlist — reject anything outside it (anti cost-blowup).
+    raw_budget = os.environ.get("ITS_BUDGET", "4")
+    try:
+        budget = int(raw_budget)
+    except ValueError:
+        budget = None
+    if budget not in _ALLOWED_BUDGETS:
+        return _accuracy_result(
+            0.0,
+            False,
+            f"ITS_BUDGET must be one of {sorted(_ALLOWED_BUDGETS)} (got {raw_budget!r})",
+        )
+
+    try:
+        timeout_s = int(os.environ.get("ITS_EVAL_TIMEOUT", str(_DEFAULT_TIMEOUT)))
+    except ValueError:
+        timeout_s = _DEFAULT_TIMEOUT
+
+    if not _endpoint_reachable(endpoint):
+        return _accuracy_result(
+            0.0,
+            False,
+            f"endpoint set ({endpoint}) but unreachable — is vLLM serving?",
+        )
+
+    import glob
+    import tempfile
+
+    model = os.environ.get("ITS_MODEL", "Qwen/Qwen2.5-Math-7B-Instruct")
+    api_key = (
+        os.environ.get("ITS_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or "NO_API_KEY"
+    )
+    alg = os.environ.get("ITS_ALG", "self-consistency")
+    tokens_per_step = os.environ.get("ITS_TOKENS_PER_STEP")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bench_script = os.path.join(repo_root, "benchmarking", "benchmark.py")
+
+    accuracies: dict[str, float | None] = {}
+    notes = []
+    with tempfile.TemporaryDirectory(prefix="its-accuracy-") as out_dir:
+        for bench, subset in _ACCURACY_BENCHMARKS:
+            cmd = [
+                sys.executable,
+                bench_script,
+                "--benchmark", bench,
+                "--model_name", model,
+                "--endpoint", endpoint,
+                "--api_key", api_key,
+                "--alg", alg,
+                "--subset", subset,
+                "--budgets", str(budget),
+                "--output_dir", out_dir,
+                "--is_async",
+                "--does_eval",
+                "--force_run",
+            ]
+            if tokens_per_step:
+                cmd += ["--tokens_per_step", tokens_per_step]
+            try:
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    cwd=repo_root,
+                )
+            except subprocess.TimeoutExpired:
+                notes.append(f"{bench}: timed out after {timeout_s}s")
+                accuracies[bench] = None
+                continue
+            except Exception as e:  # never let a subprocess failure crash scoring
+                notes.append(f"{bench}: run error ({type(e).__name__})")
+                accuracies[bench] = None
+                continue
+
+            matches = glob.glob(os.path.join(out_dir, f"*{bench}.jsonl"))
+            acc = _accuracy_from_jsonl(matches[0], budget) if matches else None
+            accuracies[bench] = acc
+            if acc is None:
+                notes.append(f"{bench}: no usable rows")
+
+    math_parts = [
+        accuracies[b] for b in ("math500", "aime-2024") if accuracies.get(b) is not None
+    ]
+    math_acc = sum(math_parts) / len(math_parts) if math_parts else None
+    gpqa_acc = accuracies.get("gpqa-diamond")
+
+    # No usable results at all → treat as an unreachable/degraded run.
+    if math_acc is None and gpqa_acc is None:
+        detail = "endpoint set but no usable results"
+        if notes:
+            detail += " — " + "; ".join(notes)
+        return _accuracy_result(0.0, False, detail)
+
+    score = 0.5 * (math_acc or 0.0) + 0.5 * (gpqa_acc or 0.0)
+    score = max(0.0, min(1.0, score))
+    complete = all(accuracies.get(b) is not None for b, _ in _ACCURACY_BENCHMARKS)
+
+    def _fmt(v):
+        return f"{v:.3f}" if v is not None else "n/a"
+
+    details = (
+        f"budget={budget} alg={alg} | "
+        f"math500={_fmt(accuracies.get('math500'))} "
+        f"aime={_fmt(accuracies.get('aime-2024'))} "
+        f"gpqa={_fmt(gpqa_acc)} | "
+        f"math_acc={_fmt(math_acc)} science_acc={_fmt(gpqa_acc)} "
+        f"-> score={score:.4f}"
+    )
+    if notes:
+        details += " | " + "; ".join(notes)
+
+    return _accuracy_result(score, complete and score > 0.0, details)
+
+
 # Register all eval functions here.
-EVALS = [eval_tests, eval_lint, eval_coverage, eval_observability]
+EVALS = [eval_tests, eval_lint, eval_coverage, eval_observability, eval_accuracy]
 
 
 def main() -> None:

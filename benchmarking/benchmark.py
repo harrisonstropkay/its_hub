@@ -1,18 +1,23 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
 import os
+import random
 import re
 import time
 from enum import Enum
+from typing import TYPE_CHECKING
 
-import asyncio
 import click
-import datasets
-import math_verify
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
 
-from reward_hub.base import AggregationMethod
-
+# NOTE: heavy / optional dependencies (``datasets``, ``math_verify``, ``pandas``,
+# ``tqdm``, ``reward_hub``) are imported lazily inside the functions that use
+# them. This keeps light-weight, pure-Python helpers such as ``grade_response``
+# importable (and unit-testable) in environments that only install the base /
+# ``lm`` extras — e.g. the eval harness box without the research/experimental
+# extras or a GPU.
 from its_hub import OpenAICompatibleLanguageModel, SelfConsistency, StepGeneration
 from its_hub.core.algorithms.beam_search import BeamSearch
 from its_hub.core.algorithms.particle_gibbs import (
@@ -20,20 +25,88 @@ from its_hub.core.algorithms.particle_gibbs import (
     ParticleFiltering,
     _softmax,
 )
-from its_hub.core.reward_models.local_vllm_prm import LocalVllmProcessRewardModel
 from its_hub.core.utils import (
     QWEN_SYSTEM_PROMPT,
     SAL_STEP_BY_STEP_SYSTEM_PROMPT,
     extract_content_from_lm_response,
 )
 
+if TYPE_CHECKING:  # only for type annotations — kept lazy at runtime
+    import pandas as pd
+    from reward_hub.base import AggregationMethod
+
 
 class BenchmarkDataset(Enum):
     MATH500 = "math500"
     AIME_2024 = "aime-2024"
+    GPQA_DIAMOND = "gpqa-diamond"
+
+
+# Option letters used to label the multiple-choice GPQA-Diamond answers.
+GPQA_OPTION_LETTERS = ["A", "B", "C", "D"]
+
+
+def _gpqa_field(row: dict, *names: str):
+    """Return the first present, non-null value among ``names`` in a GPQA row.
+
+    The public ``Idavidrein/gpqa`` dataset uses title-cased column names
+    (``"Question"``, ``"Correct Answer"``, ...); we also accept lower/underscore
+    variants so the loader is robust to minor schema drift.
+    """
+    for name in names:
+        if name in row and row[name] is not None:
+            return row[name]
+    raise KeyError(f"none of {names!r} present in GPQA row")
+
+
+def _normalize_gpqa_row(row: dict, idx: int) -> dict:
+    """Normalize one GPQA-Diamond row into ``{problem, answer, unique_id}``.
+
+    GPQA is multiple-choice: ``problem`` is the question followed by four labeled
+    options ``A)/B)/C)/D)`` built from the correct answer plus the three
+    incorrect answers. The options are shuffled with a per-item seed derived from
+    ``unique_id`` so the correct choice is not positionally constant, and
+    ``answer`` is set to the correct option's LETTER.
+    """
+    question = str(_gpqa_field(row, "Question", "question")).strip()
+    correct = str(_gpqa_field(row, "Correct Answer", "correct_answer")).strip()
+    incorrects = [
+        str(
+            _gpqa_field(
+                row, f"Incorrect Answer {i}", f"incorrect_answer_{i}"
+            )
+        ).strip()
+        for i in (1, 2, 3)
+    ]
+    # Prefer the dataset's stable record id; fall back to the row index.
+    unique_id = str(
+        row.get("Record ID") or row.get("record_id") or idx
+    )
+
+    # Deterministic per-item shuffle: seed from the unique_id so ordering is
+    # reproducible across runs but the correct option's position varies by item.
+    seed = int(hashlib.sha256(unique_id.encode("utf-8")).hexdigest(), 16) % (2**32)
+    rng = random.Random(seed)
+    order = list(range(4))  # 0 == correct answer, 1..3 == incorrect answers
+    rng.shuffle(order)
+
+    options = [correct, *incorrects]
+    shuffled = [options[i] for i in order]
+    correct_letter = GPQA_OPTION_LETTERS[order.index(0)]
+    labeled = "\n".join(
+        f"{GPQA_OPTION_LETTERS[i]}) {opt}" for i, opt in enumerate(shuffled)
+    )
+    problem = (
+        f"{question}\n\n{labeled}\n\n"
+        "Please reason step by step, and put the letter of the correct option "
+        "(A, B, C, or D) in \\boxed{}."
+    )
+    return {"problem": problem, "answer": correct_letter, "unique_id": unique_id}
 
 
 def load_benchmark_dataset(dataset: BenchmarkDataset):
+    import datasets
+
     if dataset == BenchmarkDataset.MATH500:
         ds = datasets.load_dataset("HuggingFaceH4/MATH-500")["test"]
     elif dataset == BenchmarkDataset.AIME_2024:
@@ -46,6 +119,16 @@ def load_benchmark_dataset(dataset: BenchmarkDataset):
         ds = ds.cast_column("answer", datasets.Value("string"))
         # remove old columns
         ds = ds.remove_columns(old_column_names)
+    elif dataset == BenchmarkDataset.GPQA_DIAMOND:
+        # Multiple-choice hard-science benchmark (198 items). Normalize each row
+        # into the same {problem, answer, unique_id} schema the run loop consumes;
+        # see _normalize_gpqa_row for the option assembly + seeded shuffle.
+        raw = datasets.load_dataset("Idavidrein/gpqa", "gpqa_diamond")["train"]
+        ds = raw.map(
+            _normalize_gpqa_row,
+            with_indices=True,
+            remove_columns=raw.column_names,
+        )
     # add unique_id if it doesn't exist
     if "unique_id" not in ds.column_names:
         ds = ds.map(lambda _, idx: {"unique_id": idx}, with_indices=True)
@@ -66,14 +149,81 @@ def _extract_boxed(s: str) -> str:
     return boxed_matches[-1] if boxed_matches else ""
 
 
+def _extract_choice_letter(response: str) -> str | None:
+    """Extract the chosen multiple-choice letter (A-D) from a model response.
+
+    Tolerant of the common answer formats: ``\\boxed{C}``, ``answer: (B)``,
+    ``The answer is D.``, ``(A)``, or a trailing standalone letter. Returns the
+    upper-cased letter, or ``None`` when no A-D choice can be found.
+    """
+    if not response:
+        return None
+    text = str(response).strip()
+
+    # 1. \boxed{...} — matches the answer convention used in the GPQA prompt.
+    boxed = _extract_boxed(text)
+    if boxed:
+        m = re.search(r"([A-Da-d])", boxed)
+        if m:
+            return m.group(1).upper()
+
+    # 2. explicit "answer" phrasing, e.g. "answer: (B)", "final answer is C".
+    m = re.search(r"answer\b[^A-Da-d]{0,20}?\(?([A-Da-d])\)?", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # 3. an option wrapped in parentheses, e.g. "... hence (D).".
+    paren = re.findall(r"\(([A-Da-d])\)", text)
+    if paren:
+        return paren[-1].upper()
+
+    # 4. fall back to the last standalone A-D token.
+    standalone = re.findall(r"(?<![A-Za-z])([A-Da-d])(?![A-Za-z])", text)
+    if standalone:
+        return standalone[-1].upper()
+
+    return None
+
+
+def grade_response(benchmark: BenchmarkDataset, gold, response) -> bool:
+    """Grade a single model ``response`` against the ``gold`` answer.
+
+    MATH500 / AIME_2024 keep the existing ``math_verify`` path unchanged.
+    GPQA_DIAMOND is multiple-choice and is graded by letter/choice matching —
+    ``math_verify`` is never called on it (choices are letters, not expressions).
+    """
+    if benchmark == BenchmarkDataset.GPQA_DIAMOND:
+        chosen = _extract_choice_letter(response)
+        if chosen is None:
+            return False
+        # gold is the correct letter, but be tolerant if it arrives wrapped.
+        gold_letter = _extract_choice_letter(gold) or str(gold).strip().upper()
+        return chosen == gold_letter
+
+    import math_verify
+
+    return bool(
+        math_verify.verify(
+            math_verify.parse(gold),
+            math_verify.parse(response),
+        )
+    )
+
+
 def init_algorithm(
     alg: ScalingAlgorithm,
     model_name: str,
     rm_name: str,
     rm_device: str,
     rm_agg_method: AggregationMethod,
-    tokens_per_step: int = None,
+    tokens_per_step: int | None = None,
 ):
+    # Imported lazily: reward_hub / vLLM are only needed for the PRM-based
+    # (beam-search / particle-filtering) algorithms.
+    from its_hub.core.reward_models.local_vllm_prm import (
+        LocalVllmProcessRewardModel,
+    )
+
     if alg == ScalingAlgorithm.SELF_CONSISTENCY:
         return SelfConsistency(_extract_boxed)
     elif alg == ScalingAlgorithm.BEAM_SEARCH:
@@ -189,10 +339,13 @@ def display_results(df: pd.DataFrame):
 )
 @click.option(
     "--rm_agg_method",
-    type=click.Choice([e.value for e in AggregationMethod]),
+    type=str,
     default="model",
-    callback=lambda ctx, param, value: AggregationMethod(value),
-    help="aggregation method to use for reward model",
+    # Parsed lazily so importing this module doesn't require reward_hub.
+    callback=lambda ctx, param, value: __import__(
+        "reward_hub.base", fromlist=["AggregationMethod"]
+    ).AggregationMethod(value),
+    help="aggregation method to use for reward model (from reward_hub AggregationMethod)",
 )
 @click.option(
     "--alg",
@@ -267,6 +420,9 @@ def main(
     display_only: bool,
     tokens_per_step: int,
 ):
+    import pandas as pd
+    from tqdm import tqdm
+
     # print all arguments using click context
     ctx = click.get_current_context()
     print("running with arguments:")
@@ -428,9 +584,10 @@ def main(
                 if does_eval:
                     if eval_expected_pass_at_one:
                         c = [
-                            math_verify.verify(
-                                math_verify.parse(x["answer"]),
-                                math_verify.parse(extract_content_from_lm_response(y) if isinstance(y, dict) else y),
+                            grade_response(
+                                benchmark,
+                                x["answer"],
+                                extract_content_from_lm_response(y) if isinstance(y, dict) else y,
                             )
                             for y in row["responses"]
                         ]
@@ -438,9 +595,8 @@ def main(
                         row["correct"] = np.dot(p, c)
                     else:
                         response_content = extract_content_from_lm_response(row["response"]) if isinstance(row["response"], dict) else row["response"]
-                        row["correct"] = math_verify.verify(
-                            math_verify.parse(x["answer"]),
-                            math_verify.parse(response_content),
+                        row["correct"] = grade_response(
+                            benchmark, x["answer"], response_content
                         )
                 rows.append(row)
 
