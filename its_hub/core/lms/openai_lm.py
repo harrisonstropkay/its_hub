@@ -1,9 +1,13 @@
 import asyncio
+import hashlib
+import json
 import logging
+import os
 import ssl
 import threading
 import warnings
 import weakref
+from pathlib import Path
 
 import aiohttp
 import backoff
@@ -21,6 +25,183 @@ from its_hub.api import (
     should_retry,
 )
 from its_hub.core.utils import resolve_max_completion_tokens
+
+# ---------------------------------------------------------------------------
+# Deterministic verification cache (H1)
+#
+# Records the ONE stochastic event in the ITS pipeline -- the LM HTTP response
+# -- at the client seam so that aggregation-only experiments (voting,
+# confidence weighting, medoid selection, ...) can be replayed off-GPU,
+# byte-identical, without regenerating samples.
+#
+# Mode is selected via the ITS_CACHE_MODE environment variable:
+#   off    (default) -- no caching; behaviour is byte-identical to no-cache and
+#                       the cache key is never computed on the hot path.
+#   record           -- on hit, return the cached response; on miss, call the
+#                       API as normal and write (key -> response) afterwards.
+#   replay           -- on hit, return the cached response; on miss, raise
+#                       CacheMissError (NEVER call the API, NEVER regenerate).
+# ---------------------------------------------------------------------------
+
+# Environment variable that selects the cache mode.
+ITS_CACHE_MODE_ENV = "ITS_CACHE_MODE"
+_VALID_CACHE_MODES = frozenset({"off", "record", "replay"})
+_DEFAULT_CACHE_DIR = Path(".factory/cache/lm_responses")
+
+# Parameters that affect generation and therefore participate in the cache key.
+# Order is irrelevant (JSON is emitted with sorted keys) but the set is fixed.
+_CACHE_KEY_PARAMS = (
+    "temperature",
+    "stop",
+    "max_completion_tokens",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "logprobs",
+    "top_logprobs",
+)
+
+
+class CacheMissError(RuntimeError):
+    """Raised when replay mode encounters a cache miss.
+
+    In replay mode the API is never called, so a missing entry is a hard
+    failure -- silently regenerating would break the reproducibility contract
+    (replay == the recorded draw, byte-identical).
+    """
+
+
+def _compute_cache_key(request_data: dict, model_name: str) -> str:
+    """Content-addressed SHA256 key for an LM request.
+
+    The key covers every parameter that affects generation. It is built with a
+    ``dict.get`` per field so that:
+
+    * a missing field and an explicit ``None`` collapse to the same ``null``
+      (they mean the same thing to the API), while
+    * ``tools=[]`` and ``tools=None`` stay distinct ([] is serialized, None is
+      the JSON null), and
+    * ``logprobs=True`` and ``logprobs=False``/``None`` are distinct entries
+      (the API may return different metadata; exact replay demands separation).
+
+    Returns a 64-char hex digest.
+    """
+    key_obj = {
+        "model": model_name,
+        # messages are always present in a prepared request; keep them explicit
+        # so a malformed request fails loudly rather than hashing to a shared key
+        "messages": request_data["messages"],
+    }
+    for param in _CACHE_KEY_PARAMS:
+        key_obj[param] = request_data.get(param)
+
+    canonical_json = json.dumps(key_obj, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+class LMResponseCache:
+    """JSONL-backed store of recorded LM responses.
+
+    Entries are sharded into buckets named by the first 8 hex chars of the
+    cache key (256^4 buckets keeps any single file small). Each line is a
+    self-contained JSON object holding the full response payload -- including
+    ``_logprobs`` -- so replay is byte-preservable through a JSON round-trip.
+
+    **Multiset / sequential replay.** A single self-consistency (or best-of-N)
+    generation fires N requests with an *identical* key (same prompt, params,
+    model) and, at temperature>0, draws N *distinct* samples. The cache must
+    therefore behave as an ordered log per key, not a single value:
+
+    * ``put`` appends -- multiple draws under one key are all retained.
+    * ``get`` serves the recorded draws in file order, one per call, advancing a
+      per-key cursor. The first ``get`` for a key snapshots the on-disk entries
+      into memory; later ``put`` calls in the same run do NOT feed back into that
+      snapshot. This makes ``record`` capture N distinct fresh draws regardless
+      of concurrency (every request in a fresh run misses the frozen snapshot),
+      while still returning prior-run entries on a re-record. When the recorded
+      draws for a key are exhausted, ``get`` returns ``None`` (a replay miss).
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path | str | None = None,
+        mode: str | None = None,
+    ):
+        # Resolve the dir at call time (not def time) so the module-level
+        # default remains overridable, e.g. in tests.
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else _DEFAULT_CACHE_DIR
+        self.mode = mode if mode is not None else _resolve_cache_mode()
+        if self.mode not in _VALID_CACHE_MODES:
+            raise ValueError(
+                f"Invalid {ITS_CACHE_MODE_ENV}={self.mode!r}; "
+                f"expected one of {sorted(_VALID_CACHE_MODES)}"
+            )
+        # Per-key snapshot of recorded responses (in file order) and a consume
+        # cursor, both established lazily on first access to a key.
+        self._entries: dict[str, list[dict]] = {}
+        self._cursors: dict[str, int] = {}
+
+    def _bucket_path(self, cache_key: str) -> Path:
+        return self.cache_dir / f"{cache_key[:8]}.jsonl"
+
+    def _load_entries(self, key: str) -> list[dict]:
+        """Read all recorded responses for ``key`` from disk, in file order."""
+        bucket = self._bucket_path(key)
+        if not bucket.exists():
+            return []
+        entries: list[dict] = []
+        with bucket.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if entry.get("cache_key") == key:
+                    entries.append(entry["response"])
+        return entries
+
+    def get(self, key: str) -> dict | None:
+        """Return the next recorded response for ``key`` or ``None`` if exhausted.
+
+        Snapshots on-disk entries on first access to the key, then serves them
+        sequentially so that N identical-key requests replay N distinct draws.
+        """
+        if key not in self._entries:
+            self._entries[key] = self._load_entries(key)
+        entries = self._entries[key]
+        idx = self._cursors.get(key, 0)
+        if idx >= len(entries):
+            return None
+        self._cursors[key] = idx + 1
+        return entries[idx]
+
+    def put(self, key: str, response_dict: dict) -> None:
+        """Append ``key -> response_dict`` to the appropriate bucket file."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        bucket = self._bucket_path(key)
+        entry = {"cache_key": key, "response": response_dict}
+        with bucket.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def _resolve_cache_mode() -> str:
+    """Read the current cache mode from the environment (default 'off')."""
+    return os.getenv(ITS_CACHE_MODE_ENV, "off")
+
+
+# Lazy module-level singleton, rebuilt when the env-selected mode changes so a
+# process can switch record -> replay within a single run (e.g. tests, the A/B
+# record-then-replay workflow).
+_cache: LMResponseCache | None = None
+
+
+def _get_cache() -> LMResponseCache:
+    """Return the process-wide cache, honoring the current ITS_CACHE_MODE."""
+    global _cache
+    mode = _resolve_cache_mode()
+    if _cache is None or _cache.mode != mode:
+        _cache = LMResponseCache(mode=mode)
+    return _cache
 
 
 class OpenAICompatibleLanguageModel(AbstractLanguageModel):
@@ -302,6 +483,22 @@ class OpenAICompatibleLanguageModel(AbstractLanguageModel):
                         top_logprobs,
                     )
 
+                    # --- verification cache (H1) ---
+                    # OFF is the default: the key is never computed and no cache
+                    # dir is touched, so behaviour is byte-identical to no-cache.
+                    cache_mode = _resolve_cache_mode()
+                    if cache_mode != "off":
+                        cache = _get_cache()
+                        cache_key = _compute_cache_key(request_data, self.model_name)
+                        cached = cache.get(cache_key)
+                        if cached is not None:
+                            return cached
+                        if cache_mode == "replay":
+                            raise CacheMissError(
+                                f"Cache miss in replay mode for key {cache_key[:16]}... "
+                                f"(model={self.model_name}, temperature={_temperature})"
+                            )
+
                     async with session.post(
                         self._chat_completion_endpoint,
                         headers=self.headers,
@@ -329,6 +526,9 @@ class OpenAICompatibleLanguageModel(AbstractLanguageModel):
                                 api_usage.get("prompt_tokens", 0),
                                 api_usage.get("completion_tokens", 0),
                             )
+                        # record the freshly-drawn sample after a successful call
+                        if cache_mode == "record":
+                            cache.put(cache_key, message)
                         return message
 
             async def safe_fetch_response(
@@ -461,6 +661,22 @@ class OpenAICompatibleLanguageModel(AbstractLanguageModel):
                 top_logprobs,
             )
 
+            # --- verification cache (H1) ---
+            # OFF is the default: the key is never computed and no cache dir is
+            # touched, so behaviour is byte-identical to no-cache.
+            cache_mode = _resolve_cache_mode()
+            if cache_mode != "off":
+                cache = _get_cache()
+                cache_key = _compute_cache_key(request_data, self.model_name)
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    return cached
+                if cache_mode == "replay":
+                    raise CacheMissError(
+                        f"Cache miss in replay mode for key {cache_key[:16]}... "
+                        f"(model={self.model_name}, temperature={_temperature})"
+                    )
+
             async with session.post(
                 self._chat_completion_endpoint,
                 headers=self.headers,
@@ -488,6 +704,9 @@ class OpenAICompatibleLanguageModel(AbstractLanguageModel):
                         api_usage.get("prompt_tokens", 0),
                         api_usage.get("completion_tokens", 0),
                     )
+                # record the freshly-drawn sample after a successful call
+                if cache_mode == "record":
+                    cache.put(cache_key, message)
                 return message
 
         async def safe_fetch_response(

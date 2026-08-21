@@ -203,3 +203,5 @@ iaas.log
 .factory/
 .factory-worktrees/
 .refactory/
+# Verification cache holds prompts -- keep it out of git even if .factory/ is un-ignored
+.factory/cache/lm_responses/
