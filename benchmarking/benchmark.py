@@ -97,8 +97,9 @@ def _normalize_gpqa_row(row: dict, idx: int) -> dict:
     )
     problem = (
         f"{question}\n\n{labeled}\n\n"
-        "Please reason step by step, and put the letter of the correct option "
-        "(A, B, C, or D) in \\boxed{}."
+        "Please reason step by step, then end your response with your chosen "
+        "option on its own line as 'Answer: X' AND put that same letter in "
+        "\\boxed{X}, where X is exactly one of A, B, C, or D."
     )
     return {"problem": problem, "answer": correct_letter, "unique_id": unique_id}
 
@@ -209,6 +210,63 @@ def grade_response(benchmark: BenchmarkDataset, gold, response) -> bool:
     )
 
 
+def _extract_choice_letter_or_empty(response: str) -> str:
+    """Self-consistency vote-key projection for GPQA-Diamond (MCQ).
+
+    Parses the model's OWN generated text for its chosen A-D option (via
+    ``_extract_choice_letter``) and returns that letter as the vote key, or an
+    empty string when no choice is parseable. This makes self-consistency vote
+    over the discrete choices ``{A, B, C, D}`` instead of collapsing every draw
+    into one degenerate empty ``\\boxed{}`` group — Qwen2.5-Math rarely emits
+    ``\\boxed{letter}`` on multiple-choice items, which is why the numeric
+    ``_extract_boxed`` projection produced all-empty keys and no voting occurred.
+
+    Integrity: this reads ONLY the model's response text. It never reads the
+    ground-truth answer key and never hard-codes an answer — it changes only how
+    the model's answer is EXTRACTED FOR VOTING, not how the selected response is
+    graded against gold (``grade_response`` is unchanged).
+    """
+    return _extract_choice_letter(response) or ""
+
+
+def _projection_func_for(benchmark: BenchmarkDataset | None):
+    """Select the self-consistency vote-key projection for a benchmark.
+
+    GPQA-Diamond is multiple-choice: project onto the model's chosen letter so
+    voting ranges over ``{A, B, C, D}``. MATH500 / AIME-2024 (and the default
+    when no benchmark is given) keep the existing numeric ``_extract_boxed`` path
+    completely unchanged.
+    """
+    if benchmark == BenchmarkDataset.GPQA_DIAMOND:
+        return _extract_choice_letter_or_empty
+    return _extract_boxed
+
+
+def _seed_global_random_from_env() -> int | None:
+    """Seed Python's global ``random`` from ``ITS_SEED`` (H4.9 sub-part b).
+
+    The self-consistency plurality tie-break falls back to ``random.choice``
+    (``its_hub/core/algorithms/_sc_voting.py``); that draws from the process-wide
+    ``random`` module, which ``ITS_SEED`` never reached before — only the LM
+    sampling seed / cache key did. Seeding it here makes plurality voting (most
+    visibly on GPQA, where every draw lands in one vote group) REPRODUCIBLE
+    across repeats under a fixed ``ITS_SEED``.
+
+    Returns the applied seed, or ``None`` when ``ITS_SEED`` is unset or invalid —
+    in which case the global RNG is left untouched so the default scored path is
+    byte-identical to today. Seeds only the tie-break RNG; reads no ground truth.
+    """
+    raw = os.environ.get("ITS_SEED")
+    if raw in (None, ""):
+        return None
+    try:
+        seed = int(raw)
+    except ValueError:
+        return None
+    random.seed(seed)
+    return seed
+
+
 def init_algorithm(
     alg: ScalingAlgorithm,
     model_name: str,
@@ -216,11 +274,16 @@ def init_algorithm(
     rm_device: str,
     rm_agg_method: str,
     tokens_per_step: int | None = None,
+    benchmark: BenchmarkDataset | None = None,
 ):
     if alg == ScalingAlgorithm.SELF_CONSISTENCY:
         # Self-consistency uses no reward model, so return before importing
         # anything that pulls in reward_hub / vLLM (the ``experimental`` extra).
-        return SelfConsistency(_extract_boxed)
+        # The vote-key projection is selected PER-BENCHMARK: GPQA-Diamond votes
+        # over the model's chosen A-D letter (so MCQ items produce non-empty vote
+        # groups) while MATH500 / AIME-2024 keep the numeric ``_extract_boxed``
+        # path unchanged (default when no benchmark is supplied).
+        return SelfConsistency(_projection_func_for(benchmark))
 
     # PRM-based algorithms below. reward_hub / vLLM are imported lazily here so
     # the self-consistency path above stays importable without the experimental
@@ -439,6 +502,16 @@ def main(
     for param_name, param_value in ctx.params.items():
         print(f"  {param_name}: {param_value}")
 
+    # H4.9(b): thread ITS_SEED into Python's global ``random`` module so the
+    # plurality vote tie-break (``random.choice`` in the self-consistency
+    # selector, reachable from self_consistency.py) is REPRODUCIBLE across
+    # repeats under a fixed seed. eval/score.py forwards ITS_SEED into this
+    # subprocess's environment when a seed is requested; when ITS_SEED is unset
+    # or invalid the global RNG is left untouched, so the default scored path is
+    # byte-identical to today. This seeds only the tie-break RNG — it does not
+    # read ground truth, change grading, or alter the composite weighting.
+    _seed_global_random_from_env()
+
     if eval_expected_pass_at_one:
         assert alg in [
             ScalingAlgorithm.PARTICLE_FILTERING,
@@ -523,6 +596,7 @@ def main(
         rm_device,
         rm_agg_method,
         tokens_per_step,
+        benchmark=benchmark,
     )
 
     # ensure output directory exists
