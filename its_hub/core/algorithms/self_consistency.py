@@ -240,17 +240,52 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 self._extract_tool_call_features(responses[i]) for i in eligible_indices
             ]
         else:
-            eligible_indices = [
+            content_indices = [
                 i for i, r in enumerate(responses) if not r.get("tool_calls")
             ]
-            projected = [
+            content_projected = [
                 self.consistency_space_projection_func(
                     extract_content_from_lm_response(responses[i])
                 )
-                for i in eligible_indices
+                for i in content_indices
             ]
+            # Answer-bearing eligibility filter: responses whose projection is
+            # None/empty/whitespace-only carry no answer and must not win the
+            # majority vote (mirrors the tool-call eligibility filter above).
+            # If EVERY projection is empty, fall back to the full content set so
+            # _process_responses still has at least one candidate (never zero).
+            non_empty = [
+                (idx, proj)
+                for idx, proj in zip(content_indices, content_projected)
+                if not self._is_empty_projection(proj)
+            ]
+            if non_empty:
+                eligible_indices = [idx for idx, _ in non_empty]
+                projected = [proj for _, proj in non_empty]
+            else:
+                eligible_indices = content_indices
+                projected = content_projected
 
         return eligible_indices, projected
+
+    @staticmethod
+    def _is_empty_projection(projected) -> bool:
+        """Whether a content projection carries no answer.
+
+        A projection is empty (ineligible to win a vote) when it is None, an
+        empty/whitespace-only string, or a hierarchical tuple whose every level
+        is itself None or empty/whitespace-only. Any other value is answer-bearing.
+        """
+        if projected is None:
+            return True
+        if isinstance(projected, str):
+            return projected.strip() == ""
+        if isinstance(projected, tuple):
+            return all(
+                level is None or (isinstance(level, str) and level.strip() == "")
+                for level in projected
+            )
+        return False
 
     def _process_responses(
         self,
