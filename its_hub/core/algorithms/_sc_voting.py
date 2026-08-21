@@ -52,17 +52,23 @@ def _tiebreak_by_confidence(
 def _select_most_common_or_random(
     list_to_select_from: list[str],
     tiebreak_scores: list[float | None] | None = None,
+    vote_keys: list | None = None,
 ) -> tuple[Counter, int]:
+    # Group votes on ``vote_keys`` when provided (formatting-invariant canonical
+    # keys aligned positionally to ``list_to_select_from``) so that variants that
+    # denote the same answer merge into one group before counting. When None,
+    # counting is byte-identical to the raw-projection behavior. The returned
+    # index is always a position into ``list_to_select_from``.
+    keys = vote_keys if vote_keys is not None else list_to_select_from
+
     # count occurrences of each element
-    counts = Counter(list_to_select_from)
+    counts = Counter(keys)
 
     # find the element with maximum occurrences
     max_count = max(counts.values())
 
     # find indices of the most common elements
-    most_common_indices = [
-        i for i, r in enumerate(list_to_select_from) if counts[r] == max_count
-    ]
+    most_common_indices = [i for i, r in enumerate(keys) if counts[r] == max_count]
 
     # A "tie" is >=2 DISTINCT answer groups sharing the top count. When a single
     # group holds the top count (clear majority) behavior is byte-unchanged: a
@@ -83,23 +89,30 @@ def _select_most_common_or_random(
 def _select_hierarchical_most_common_or_random(
     list_to_select_from: list[tuple],
     tiebreak_scores: list[float | None] | None = None,
+    vote_keys: list | None = None,
 ) -> tuple[Counter, int]:
     if not list_to_select_from:
         raise ValueError("Cannot select from empty list")
 
+    # Group/level votes on ``vote_keys`` (formatting-invariant canonical tuples
+    # aligned positionally) when provided; otherwise on the raw projections,
+    # byte-identical to the prior behavior. The returned index is always a
+    # position into ``list_to_select_from``.
+    keys = vote_keys if vote_keys is not None else list_to_select_from
+
     # If all elements are single-element tuples, fall back to flat behavior
-    if all(len(item) == 1 for item in list_to_select_from):
-        flat_list = [item[0] for item in list_to_select_from]
+    if all(len(item) == 1 for item in keys):
+        flat_list = [item[0] for item in keys]
         _, selected_index = _select_most_common_or_random(flat_list, tiebreak_scores)
         # Convert back to tuple format for consistency
-        tuple_counts = Counter(list_to_select_from)
+        tuple_counts = Counter(keys)
         return tuple_counts, selected_index
 
     # Find the maximum hierarchy depth
-    max_depth = max(len(item) for item in list_to_select_from)
+    max_depth = max(len(item) for item in keys)
 
     # Start with all indices as candidates
-    candidate_indices = list(range(len(list_to_select_from)))
+    candidate_indices = list(range(len(keys)))
 
     # Process each level of the hierarchy
     for level in range(max_depth):
@@ -108,7 +121,7 @@ def _select_hierarchical_most_common_or_random(
         valid_indices = []
 
         for idx in candidate_indices:
-            item = list_to_select_from[idx]
+            item = keys[idx]
             if level < len(item):
                 level_values.append(item[level])
                 valid_indices.append(idx)
@@ -137,13 +150,13 @@ def _select_hierarchical_most_common_or_random(
     # tie-break when scores are available. If they are all the same tuple (a
     # clear winner with multiple identical members) behavior is byte-unchanged:
     # a random member is returned exactly as before.
-    distinct_survivors = {list_to_select_from[idx] for idx in candidate_indices}
+    distinct_survivors = {keys[idx] for idx in candidate_indices}
     if len(distinct_survivors) >= 2 and tiebreak_scores is not None:
         selected_index = _tiebreak_by_confidence(candidate_indices, tiebreak_scores)
     else:
         selected_index = random.choice(candidate_indices)
 
-    # Count all original tuples for the result
-    tuple_counts = Counter(list_to_select_from)
+    # Count all vote groups for the result
+    tuple_counts = Counter(keys)
 
     return tuple_counts, selected_index

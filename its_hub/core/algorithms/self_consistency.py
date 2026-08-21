@@ -22,7 +22,10 @@ from its_hub.core.algorithms._sc_voting import (
     _tiebreak_by_confidence,
 )
 from its_hub.core.orchestrator import LMOrchestrator
-from its_hub.core.utils import extract_content_from_lm_response
+from its_hub.core.utils import (
+    _canonicalize_vote_key,
+    extract_content_from_lm_response,
+)
 
 # Re-exported for backward compatibility: these voting/selection helpers now
 # live in ``_sc_voting`` but are still imported from this module by
@@ -149,6 +152,19 @@ class SelfConsistency(AbstractScalingAlgorithm):
         # process responses and return result
         return self._process_responses(responses, return_response_only, usage)
 
+    def _is_tool_vote_path(self, responses: list[dict]) -> bool:
+        """Whether voting routes through tool-call signatures (vs content).
+
+        Mirrors the branch decision in ``_project_responses`` so callers can tell
+        which projection space a response list will use without re-projecting.
+        Tool-call signatures are already normalized and must NOT be
+        text-canonicalized for vote grouping.
+        """
+        tool_call_count = sum(1 for r in responses if r.get("tool_calls"))
+        required_majority = math.ceil(len(responses) / 2)
+        has_majority_tool_calls = tool_call_count >= required_majority
+        return bool(has_majority_tool_calls and self.tool_vote)
+
     def _project_responses(self, responses: list[dict]) -> tuple[list[int], list]:
         """Project responses to comparable values for voting.
 
@@ -158,11 +174,7 @@ class SelfConsistency(AbstractScalingAlgorithm):
             (eligible_indices, projected_values) where eligible_indices maps
             back to positions in the original responses list.
         """
-        tool_call_count = sum(1 for r in responses if r.get("tool_calls"))
-        required_majority = math.ceil(len(responses) / 2)
-        has_majority_tool_calls = tool_call_count >= required_majority
-
-        if has_majority_tool_calls and self.tool_vote:
+        if self._is_tool_vote_path(responses):
             eligible_indices = [
                 i for i, r in enumerate(responses) if r.get("tool_calls")
             ]
@@ -262,6 +274,18 @@ class SelfConsistency(AbstractScalingAlgorithm):
 
         eligible_indices, responses_projected = self._project_responses(responses)
 
+        # Formatting-invariant vote keys for COUNTING only: on the content path,
+        # group answers that differ merely in presentation (e.g. \boxed{\text{C}}
+        # vs \boxed{C} vs (C)) into one vote group before counting. On the
+        # tool-call path the raw projections are already canonical signatures and
+        # must not be text-canonicalized, so the keys are the projections as-is.
+        # Selection still returns a real response index and the_one still returns
+        # the full, unmodified selected response for the grader to re-extract.
+        if self._is_tool_vote_path(responses):
+            vote_keys = responses_projected
+        else:
+            vote_keys = [_canonicalize_vote_key(proj) for proj in responses_projected]
+
         # Error if no eligible responses after filtering
         if not eligible_indices:
             raise ValueError(
@@ -278,16 +302,18 @@ class SelfConsistency(AbstractScalingAlgorithm):
         if all(score is None for score in tiebreak_scores):
             tiebreak_scores = None
 
-        # Determine if we're dealing with hierarchical (tuple) or flat projections
+        # Determine if we're dealing with hierarchical (tuple) or flat projections.
+        # vote_keys carries the canonical grouping key (aligned to the projected
+        # list); selection returns a position into the eligible list either way.
         if responses_projected and isinstance(responses_projected[0], tuple):
             response_counts, filtered_selected_index = (
                 _select_hierarchical_most_common_or_random(
-                    responses_projected, tiebreak_scores
+                    responses_projected, tiebreak_scores, vote_keys=vote_keys
                 )
             )
         else:
             response_counts, filtered_selected_index = _select_most_common_or_random(
-                responses_projected, tiebreak_scores
+                responses_projected, tiebreak_scores, vote_keys=vote_keys
             )
 
         # Map back to original index

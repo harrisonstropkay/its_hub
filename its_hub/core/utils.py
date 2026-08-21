@@ -1,4 +1,5 @@
 import json
+import re
 import warnings
 
 # the system prompt for step-by-step reasoning taken from https://github.com/huggingface/search-and-learn
@@ -27,6 +28,77 @@ def resolve_max_completion_tokens(
         )
         return max_tokens
     return max_completion_tokens
+
+
+# --- Vote-key canonicalization (VOTING ONLY) -------------------------------
+# LaTeX display/formatting wrappers that carry no answer content and should be
+# unwrapped before comparing votes: ``\text{C}`` / ``\mathrm{C}`` / ``\mathbf{C}``
+# / ``\textbf{C}`` / ``\mathit{C}`` all denote the same answer ``C``.
+_LATEX_WRAPPER_RE = re.compile(r"\\(?:text|textbf|mathrm|mathbf|mathit)\s*\{([^{}]*)\}")
+# An isolated single option-letter answer in any common decoration:
+#   ``C``  ``(C)``  ``C.``  ``C)``  ``[C]``  (optionally surrounded by whitespace).
+_ISOLATED_OPTION_LETTER_RE = re.compile(r"^[(\[]?\s*([A-Za-z])\s*[).\]]?$")
+
+
+def _canonicalize_vote_key(projected):
+    """Return a formatting-invariant vote key for an already-projected answer.
+
+    Used **only** for grouping votes in the self-consistency family so that
+    formatting-variant projections that denote the *same* answer merge into one
+    vote group before counting. It is deliberately CONSERVATIVE and
+    domain-general: it strips presentation wrappers/whitespace and normalizes an
+    isolated option-letter's decoration/case, but it NEVER rewrites free-form
+    numeric or expression content (e.g. ``1/2`` and ``0.5``, or ``x=2`` and
+    ``2``, stay distinct). When in doubt it returns the raw projection.
+
+    This does not touch the responses themselves: the grader still independently
+    re-extracts the final answer from the full, unmodified selected response.
+
+    Non-string inputs are returned unchanged; tuples are canonicalized
+    element-wise so hierarchical (regex) projections are handled uniformly.
+    """
+    if isinstance(projected, tuple):
+        return tuple(_canonicalize_vote_key(part) for part in projected)
+    if not isinstance(projected, str):
+        return projected
+
+    original = projected
+    s = projected.strip()
+    if s == "":
+        return s
+
+    # 1. Strip LaTeX formatting wrappers (repeatedly, to unwrap nesting such as
+    #    ``\text{\mathbf{C}}``) and surrounding math-mode ``$...$`` delimiters and
+    #    outer braces/whitespace. Brace stripping is guarded so we never collapse
+    #    a structured answer (e.g. a set/tuple ``{1,2}``) into its interior.
+    prev = None
+    while prev != s:
+        prev = s
+        s = _LATEX_WRAPPER_RE.sub(r"\1", s).strip()
+        if len(s) >= 2 and s[0] == "$" and s[-1] == "$":
+            s = s[1:-1].strip()
+        if (
+            len(s) >= 2
+            and s[0] == "{"
+            and s[-1] == "}"
+            and "{" not in s[1:-1]
+            and "}" not in s[1:-1]
+            and "," not in s[1:-1]
+        ):
+            s = s[1:-1].strip()
+
+    # 2. Normalize an isolated single option-letter answer to a bare uppercase
+    #    letter (``\text{C}`` -> ``C``, ``(C)`` -> ``C``, ``c`` -> ``C``). Case
+    #    is collapsed ONLY here, where it is provably formatting.
+    match = _ISOLATED_OPTION_LETTER_RE.match(s)
+    if match:
+        return match.group(1).upper()
+
+    # 3. Never canonicalize a non-empty answer down to nothing; if wrapper/brace
+    #    stripping emptied it, keep the raw (stripped) projection instead.
+    if s == "":
+        return original.strip()
+    return s
 
 
 def extract_content_from_lm_response(message: dict) -> str:
