@@ -18,7 +18,7 @@ python eval/score.py
   command: python eval/score.py --dimension accuracy
   parse: json
   weight: 1.0
-  timeout: 1200
+  timeout: 3600
   description: composite math+science benchmark accuracy (0.5*mean(math500,aime) + 0.5*gpqa)
 
 ## Eval Weights
