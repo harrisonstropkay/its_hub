@@ -128,6 +128,17 @@ def load_benchmark_dataset(dataset: BenchmarkDataset):
             _normalize_gpqa_row,
             with_indices=True,
             remove_columns=raw.column_names,
+            # H4.9-QA1 (DEFECT 2): force the normalize transform to re-run every
+            # time instead of loading a possibly-stale ``datasets.map`` cache.
+            # HuggingFace fingerprints ``map`` by hashing the transform, but a
+            # prior run's cache (built from the OLD MCQ prompt) can be served
+            # under default caching, leaving the new "Answer: X AND \\boxed{X}"
+            # prompt INERT on any warm-cache box. ``ITS_CACHE_MODE`` controls a
+            # different (LM-response) cache and cannot bust this one. Disabling
+            # the cache-file load for just this map guarantees the current prompt
+            # reaches the model regardless of on-disk cache state; the transform
+            # is deterministic (per-item seeded shuffle) so the output is stable.
+            load_from_cache_file=False,
         )
     # add unique_id if it doesn't exist
     if "unique_id" not in ds.column_names:
@@ -265,6 +276,38 @@ def _seed_global_random_from_env() -> int | None:
         return None
     random.seed(seed)
     return seed
+
+
+def _lm_sampling_seed(resolved_seed: int | None) -> int | None:
+    """Sampling seed to forward to the LM (H4.9-QA1 DEFECT 1).
+
+    ``resolved_seed`` is the value returned by ``_seed_global_random_from_env``
+    (the ``ITS_SEED`` integer, or ``None`` when unset/empty/invalid). Forwarding
+    it into ``OpenAICompatibleLanguageModel(seed=...)`` reaches vLLM
+    ``SamplingParams(seed=...)`` so that temperature>0 generation is
+    REPRODUCIBLE across identical repeats — the missing half of the fix
+    (``_seed_global_random_from_env`` only seeded the plurality tie-break RNG,
+    never the LM draw, so GPQA still swung run-to-run).
+
+    Returns ``None`` (no seed forwarded — byte-identical to baseline) when:
+
+    * ``resolved_seed`` is ``None`` (``ITS_SEED`` unset/empty/invalid): the
+      default MATH500/AIME path is left completely untouched, AND
+    * the H1 verification cache is in ``record``/``replay`` mode: there the
+      recorded draw is the source of determinism, so a live sampling seed is
+      unnecessary and would only perturb the H1 cache key (which includes the
+      seed when set), missing caches recorded without it. Only the ``off``
+      (live) mode — the default and the mode the reproducibility run uses — lets
+      the sampling seed govern the draw.
+
+    Seeds are applied to LIVE generation only; grading, weighting, and slice
+    definitions are never touched.
+    """
+    if resolved_seed is None:
+        return None
+    if os.getenv("ITS_CACHE_MODE", "off") != "off":
+        return None
+    return resolved_seed
 
 
 def init_algorithm(
@@ -510,7 +553,12 @@ def main(
     # or invalid the global RNG is left untouched, so the default scored path is
     # byte-identical to today. This seeds only the tie-break RNG — it does not
     # read ground truth, change grading, or alter the composite weighting.
-    _seed_global_random_from_env()
+    #
+    # H4.9-QA1 (DEFECT 1): capture the resolved seed so it can ALSO be threaded
+    # into the LM sampling seed below. Seeding only the tie-break RNG left LM
+    # generation unseeded, so GPQA still varied run-to-run at temperature>0;
+    # forwarding the seed to vLLM SamplingParams makes the live path reproducible.
+    resolved_seed = _seed_global_random_from_env()
 
     if eval_expected_pass_at_one:
         assert alg in [
@@ -586,6 +634,11 @@ def main(
             temperature=temperature,
             max_completion_tokens=max_completion_tokens,
             max_concurrency=max_concurrency,
+            # H4.9-QA1 (DEFECT 1): reproducible LM sampling. None (ITS_SEED unset
+            # or a record/replay cache mode) → no ``seed`` key in the request
+            # payload → byte-identical to baseline; an int → vLLM
+            # SamplingParams(seed=...) → deterministic generation across repeats.
+            seed=_lm_sampling_seed(resolved_seed),
         )
 
     print("initializing algorithm...")
