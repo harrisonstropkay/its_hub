@@ -7,8 +7,94 @@ imports (including ``weighted_self_consistency`` and the test suite) continue to
 resolve unchanged.
 """
 
+import math
+import os
 import random
 from collections import Counter
+
+# A/B switch for the self-consistency voting rule. ``plurality`` (the default)
+# is the historical max-count vote with the H2 confidence tie-break; the env var
+# ``ITS_SC_VOTE`` may switch it to ``confidence`` for full confidence-weighted
+# voting (H5). Resolved at the selection call site so a single env var flips both
+# the flat and hierarchical selectors with NO code edits between A/B runs. Any
+# unrecognized value resolves to ``plurality`` so the default path is unchanged.
+_VOTE_MODE_ENV_VAR = "ITS_SC_VOTE"
+
+
+def _resolve_vote_mode() -> str:
+    """Read the voting mode from ``ITS_SC_VOTE`` (default ``plurality``).
+
+    Returns ``"confidence"`` only for an explicit, case-insensitive
+    ``confidence`` value; every other value (including unset) returns
+    ``"plurality"`` so the default behavior is byte-identical to today.
+    """
+    mode = os.environ.get(_VOTE_MODE_ENV_VAR, "plurality").strip().lower()
+    return "confidence" if mode == "confidence" else "plurality"
+
+
+def _has_confidence_scores(tiebreak_scores: list[float | None] | None) -> bool:
+    """Whether confidence weighting can run: at least one real logprob score.
+
+    Confidence mode requires positive-weight-bearing candidates; when scores are
+    entirely absent (``None`` or every entry ``None``) the caller must fall back
+    to the plurality path rather than degenerate.
+    """
+    return tiebreak_scores is not None and any(
+        s is not None for s in tiebreak_scores
+    )
+
+
+def _confidence_weight(mean_logprob: float) -> float:
+    """Convert a mean-per-token logprob into a POSITIVE confidence weight.
+
+    ``tiebreak_scores`` hold mean-per-token log-probabilities, which are
+    NEGATIVE. Summing those raw values per answer group would reward SMALLER
+    groups (fewer negative terms) -- the exact opposite of what a vote needs. We
+    instead map each candidate to ``exp(mean_logprob)``: the geometric-mean
+    per-token probability of its answer, a value in ``(0, 1]``. Because the
+    weight is bounded above by 1, a single hyper-confident outlier (weight -> 1)
+    cannot outvote a larger group of moderately-confident members whose weights
+    sum above 1. This is the confidence-weighted-majority-vote formulation of
+    CISC (Taubenfeld et al., "Confidence Improves Self-Consistency in LLMs",
+    arXiv:2502.06233): the vote weight of an answer is the sum of its members'
+    confidence scores. CISC also describes a softmax over candidates; that shares
+    one positive denominator across every group, so it leaves the arg-max
+    unchanged -- hence we use the un-normalized ``exp`` directly.
+    """
+    return math.exp(mean_logprob)
+
+
+def _select_by_confidence_weight(
+    keys: list,
+    tiebreak_scores: list[float | None],
+) -> int:
+    """Return the index of the winning candidate under confidence weighting.
+
+    Each candidate contributes ``_confidence_weight(mean_logprob)`` to its
+    canonical answer group (``keys[i]``). The group with the greatest summed
+    weight wins. Determinism: group-weight ties break toward the group whose
+    first-seen member has the lowest index, and within the winning group the
+    member is chosen by the existing confidence tie-break (highest individual
+    logprob, lowest index) -- so the result never depends on ``random``.
+    Candidates lacking a logprob score contribute zero weight (they cannot swing
+    the vote) while remaining eligible members of their group.
+    """
+    group_weight: dict = {}
+    group_first_index: dict = {}
+    for i, key in enumerate(keys):
+        if key not in group_weight:
+            group_weight[key] = 0.0
+            group_first_index[key] = i
+        score = tiebreak_scores[i] if i < len(tiebreak_scores) else None
+        if score is not None:
+            group_weight[key] += _confidence_weight(score)
+
+    max_weight = max(group_weight.values())
+    winners = [k for k, w in group_weight.items() if w == max_weight]
+    winning_key = min(winners, key=lambda k: group_first_index[k])
+
+    member_indices = [i for i, key in enumerate(keys) if key == winning_key]
+    return _tiebreak_by_confidence(member_indices, tiebreak_scores)
 
 
 def _default_projection_func(response: str) -> str:
@@ -53,6 +139,7 @@ def _select_most_common_or_random(
     list_to_select_from: list[str],
     tiebreak_scores: list[float | None] | None = None,
     vote_keys: list | None = None,
+    vote_mode: str = "plurality",
 ) -> tuple[Counter, int]:
     # Group votes on ``vote_keys`` when provided (formatting-invariant canonical
     # keys aligned positionally to ``list_to_select_from``) so that variants that
@@ -63,6 +150,15 @@ def _select_most_common_or_random(
 
     # count occurrences of each element
     counts = Counter(keys)
+
+    # Full confidence-weighted voting (H5, CISC arXiv:2502.06233): when enabled
+    # via ITS_SC_VOTE=confidence, select the answer group with the maximum
+    # aggregate POSITIVE confidence weight instead of the maximum raw count.
+    # Reported ``counts`` stay frequency-based (reporting contract unchanged);
+    # only the selection changes. Falls back to the plurality path below when no
+    # logprob scores are available, so behavior degrades gracefully.
+    if vote_mode == "confidence" and _has_confidence_scores(tiebreak_scores):
+        return counts, _select_by_confidence_weight(keys, tiebreak_scores)
 
     # find the element with maximum occurrences
     max_count = max(counts.values())
@@ -90,6 +186,7 @@ def _select_hierarchical_most_common_or_random(
     list_to_select_from: list[tuple],
     tiebreak_scores: list[float | None] | None = None,
     vote_keys: list | None = None,
+    vote_mode: str = "plurality",
 ) -> tuple[Counter, int]:
     if not list_to_select_from:
         raise ValueError("Cannot select from empty list")
@@ -99,6 +196,15 @@ def _select_hierarchical_most_common_or_random(
     # byte-identical to the prior behavior. The returned index is always a
     # position into ``list_to_select_from``.
     keys = vote_keys if vote_keys is not None else list_to_select_from
+
+    # Full confidence-weighted voting (H5, CISC arXiv:2502.06233): when enabled
+    # via ITS_SC_VOTE=confidence, aggregate a positive confidence weight per full
+    # canonical answer tuple and select the max-weight group. Grouping on the
+    # whole tuple keeps distinct (name, args) tool signatures as separate answer
+    # groups. Falls back to the plurality hierarchy below when scores are
+    # unavailable, so behavior degrades gracefully.
+    if vote_mode == "confidence" and _has_confidence_scores(tiebreak_scores):
+        return Counter(keys), _select_by_confidence_weight(keys, tiebreak_scores)
 
     # If all elements are single-element tuples, fall back to flat behavior
     if all(len(item) == 1 for item in keys):

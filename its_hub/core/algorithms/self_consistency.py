@@ -17,6 +17,7 @@ from its_hub.api import (
 )
 from its_hub.core.algorithms._sc_voting import (
     _default_projection_func,
+    _resolve_vote_mode,
     _select_hierarchical_most_common_or_random,
     _select_most_common_or_random,
     _tiebreak_by_confidence,
@@ -302,18 +303,30 @@ class SelfConsistency(AbstractScalingAlgorithm):
         if all(score is None for score in tiebreak_scores):
             tiebreak_scores = None
 
+        # Voting rule A/B switch (H5): ITS_SC_VOTE=confidence enables full
+        # confidence-weighted voting; default ``plurality`` keeps the current
+        # path byte-identical. Resolved here at the call site so a single env var
+        # flips both selectors below with no code edits between A/B runs.
+        vote_mode = _resolve_vote_mode()
+
         # Determine if we're dealing with hierarchical (tuple) or flat projections.
         # vote_keys carries the canonical grouping key (aligned to the projected
         # list); selection returns a position into the eligible list either way.
         if responses_projected and isinstance(responses_projected[0], tuple):
             response_counts, filtered_selected_index = (
                 _select_hierarchical_most_common_or_random(
-                    responses_projected, tiebreak_scores, vote_keys=vote_keys
+                    responses_projected,
+                    tiebreak_scores,
+                    vote_keys=vote_keys,
+                    vote_mode=vote_mode,
                 )
             )
         else:
             response_counts, filtered_selected_index = _select_most_common_or_random(
-                responses_projected, tiebreak_scores, vote_keys=vote_keys
+                responses_projected,
+                tiebreak_scores,
+                vote_keys=vote_keys,
+                vote_mode=vote_mode,
             )
 
         # Map back to original index
