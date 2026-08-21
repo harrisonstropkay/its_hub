@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import random
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -49,28 +50,8 @@ class SelfConsistencyResult(AbstractScalingResult):
         return self.responses[self.selected_index]
 
 
-def _break_tie(candidate_indices: list[int], lengths: list[int] | None) -> int:
-    """Deterministically choose among tied vote candidates.
-
-    Completeness-aware heuristic: prefer the candidate whose generation is
-    SHORTER, using shorter completion length as a proxy for "finished, not
-    truncated mid-reasoning" (a truncated answer runs to the token limit
-    without boxing, so it is longer). The original index is a stable
-    secondary key, giving a fully deterministic result even when lengths are
-    unavailable or fail to discriminate. This replaces the former
-    ``random.choice`` tie-break so selection is reproducible run-to-run.
-
-    ``candidate_indices`` must all be tied on vote count; ``lengths`` (when
-    provided) is indexed by the same positions the candidates come from.
-    """
-    if lengths is not None:
-        return min(candidate_indices, key=lambda i: (lengths[i], i))
-    return min(candidate_indices)
-
-
 def _select_most_common_or_random(
     list_to_select_from: list[str],
-    lengths: list[int] | None = None,
 ) -> tuple[Counter, int]:
     # count occurrences of each element
     counts = Counter(list_to_select_from)
@@ -83,21 +64,16 @@ def _select_most_common_or_random(
         i for i, r in enumerate(list_to_select_from) if counts[r] == max_count
     ]
 
-    # Single clear winner: return it unchanged (non-tie path is untouched).
-    if len(most_common_indices) == 1:
-        return counts, most_common_indices[0]
-
-    # Tie among the top-voted projections: break it deterministically with a
-    # completeness-aware heuristic (shorter/complete generation, then lowest
-    # index) instead of the former nondeterministic random.choice.
-    selected_index = _break_tie(most_common_indices, lengths)
+    # select a random index from the most common ones
+    # note above implementation ensures that if there are multiple
+    #      elements with the same count, a random one is selected
+    selected_index = random.choice(most_common_indices)
 
     return counts, selected_index
 
 
 def _select_hierarchical_most_common_or_random(
     list_to_select_from: list[tuple],
-    lengths: list[int] | None = None,
 ) -> tuple[Counter, int]:
     if not list_to_select_from:
         raise ValueError("Cannot select from empty list")
@@ -105,7 +81,7 @@ def _select_hierarchical_most_common_or_random(
     # If all elements are single-element tuples, fall back to flat behavior
     if all(len(item) == 1 for item in list_to_select_from):
         flat_list = [item[0] for item in list_to_select_from]
-        _, selected_index = _select_most_common_or_random(flat_list, lengths)
+        _, selected_index = _select_most_common_or_random(flat_list)
         # Convert back to tuple format for consistency
         tuple_counts = Counter(list_to_select_from)
         return tuple_counts, selected_index
@@ -147,9 +123,8 @@ def _select_hierarchical_most_common_or_random(
         if len(candidate_indices) == 1:
             break
 
-    # Deterministically break any remaining tie (completeness-aware: shorter/
-    # complete generation, then lowest index) instead of random.choice.
-    selected_index = _break_tie(candidate_indices, lengths)
+    # Randomly select from remaining candidates
+    selected_index = random.choice(candidate_indices)
 
     # Count all original tuples for the result
     tuple_counts = Counter(list_to_select_from)
@@ -338,24 +313,14 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 "This typically happens when tool_vote is not set but all responses contain tool calls."
             )
 
-        # Generation length per eligible response (aligned with eligible_indices
-        # and responses_projected). Used only to break vote ties deterministically
-        # via a completeness heuristic; does not affect the winning-vote logic.
-        eligible_lengths = [
-            len(extract_content_from_lm_response(responses[i]) or "")
-            for i in eligible_indices
-        ]
-
         # Determine if we're dealing with hierarchical (tuple) or flat projections
         if responses_projected and isinstance(responses_projected[0], tuple):
             response_counts, filtered_selected_index = (
-                _select_hierarchical_most_common_or_random(
-                    responses_projected, eligible_lengths
-                )
+                _select_hierarchical_most_common_or_random(responses_projected)
             )
         else:
             response_counts, filtered_selected_index = _select_most_common_or_random(
-                responses_projected, eligible_lengths
+                responses_projected
             )
 
         # Map back to original index
