@@ -54,6 +54,15 @@ class TestSeedRequestPayload:
         req = _lm(seed=42)._prepare_request_data(_msgs())
         assert req["seed"] == 42
 
+    def test_seed_zero_is_present_as_integer_zero(self):
+        # Regression guard for the classic falsy-seed bug: seed=0 is a valid,
+        # meaningful seed and must be forwarded as integer 0 -- NOT omitted.
+        # A future refactor to `if self.seed:` would silently drop it here.
+        req = _lm(seed=0)._prepare_request_data(_msgs())
+        assert "seed" in req
+        assert req["seed"] == 0
+        assert isinstance(req["seed"], int)
+
     def test_seed_set_payload_equals_unseeded_plus_seed(self):
         # The ONLY difference a set seed makes to the payload is the added key.
         unseeded = _lm(seed=None)._prepare_request_data(_msgs())
@@ -82,6 +91,16 @@ class TestSeedCacheKey:
         unseeded = _lm(seed=None)._prepare_request_data(_msgs())
         seeded = _lm(seed=42)._prepare_request_data(_msgs())
         assert _compute_cache_key(seeded, "m") != _compute_cache_key(unseeded, "m")
+
+    def test_seed_zero_key_differs_from_unseeded(self):
+        # Regression guard: seed=0 must produce a cache key distinct from the
+        # unseeded golden key. If seed=0 were dropped from the payload, this key
+        # would collapse back onto the golden value and silently reuse unseeded
+        # caches.
+        unseeded = _lm(seed=None)._prepare_request_data(_msgs())
+        seeded0 = _lm(seed=0)._prepare_request_data(_msgs())
+        assert _compute_cache_key(unseeded, "m") == _GOLDEN_UNSEEDED_KEY
+        assert _compute_cache_key(seeded0, "m") != _GOLDEN_UNSEEDED_KEY
 
     def test_distinct_seeds_produce_distinct_keys(self):
         req42 = _lm(seed=42)._prepare_request_data(_msgs())
@@ -139,6 +158,45 @@ async def test_seeded_record_then_replay_roundtrip(monkeypatch, tmp_path):
             model_name="m",
             temperature=0.7,
             seed=42,
+            max_tries=1,
+        )
+
+        monkeypatch.setenv("ITS_CACHE_MODE", "record")
+        rec = await lm.agenerate_single(_msgs())
+        assert state["hits"] == 1
+        assert rec["content"] == "resp-1"
+
+        monkeypatch.setenv("ITS_CACHE_MODE", "replay")
+        rep = await lm.agenerate_single(_msgs())
+        assert state["hits"] == 1  # replayed, not regenerated
+        assert rep == rec
+        await lm.close()
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_seeded_record_then_replay_roundtrip_seed_zero(monkeypatch, tmp_path):
+    """seed=0 records and replays through the H1 cache byte-identically.
+
+    Mirrors test_seeded_record_then_replay_roundtrip but pins the falsy seed=0
+    case: the replay must be zero-regeneration (hit count unchanged) and the
+    replayed record byte-identical to the recorded one.
+    """
+    import its_hub.core.lms.openai_lm as mod
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(mod, "_cache", None)
+    monkeypatch.setattr(mod, "_DEFAULT_CACHE_DIR", cache_dir)
+
+    server, state = await _make_counting_server()
+    try:
+        lm = OpenAICompatibleLanguageModel(
+            endpoint=f"http://127.0.0.1:{server.port}/v1",
+            api_key="k",
+            model_name="m",
+            temperature=0.7,
+            seed=0,
             max_tries=1,
         )
 
