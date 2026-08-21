@@ -1,18 +1,23 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
 import os
+import random
 import re
 import time
 from enum import Enum
+from typing import TYPE_CHECKING
 
-import asyncio
 import click
-import datasets
-import math_verify
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
 
-from reward_hub.base import AggregationMethod
-
+# NOTE: heavy / optional dependencies (``datasets``, ``math_verify``, ``pandas``,
+# ``tqdm``, ``reward_hub``) are imported lazily inside the functions that use
+# them. This keeps light-weight, pure-Python helpers such as ``grade_response``
+# importable (and unit-testable) in environments that only install the base /
+# ``lm`` extras — e.g. the eval harness box without the research/experimental
+# extras or a GPU.
 from its_hub import OpenAICompatibleLanguageModel, SelfConsistency, StepGeneration
 from its_hub.core.algorithms.beam_search import BeamSearch
 from its_hub.core.algorithms.particle_gibbs import (
@@ -20,20 +25,88 @@ from its_hub.core.algorithms.particle_gibbs import (
     ParticleFiltering,
     _softmax,
 )
-from its_hub.core.reward_models.local_vllm_prm import LocalVllmProcessRewardModel
 from its_hub.core.utils import (
     QWEN_SYSTEM_PROMPT,
     SAL_STEP_BY_STEP_SYSTEM_PROMPT,
     extract_content_from_lm_response,
 )
 
+if TYPE_CHECKING:  # only for type annotations — kept lazy at runtime
+    import pandas as pd
+
 
 class BenchmarkDataset(Enum):
     MATH500 = "math500"
     AIME_2024 = "aime-2024"
+    GPQA_DIAMOND = "gpqa-diamond"
+
+
+# Option letters used to label the multiple-choice GPQA-Diamond answers.
+GPQA_OPTION_LETTERS = ["A", "B", "C", "D"]
+
+
+def _gpqa_field(row: dict, *names: str):
+    """Return the first present, non-null value among ``names`` in a GPQA row.
+
+    The public ``Idavidrein/gpqa`` dataset uses title-cased column names
+    (``"Question"``, ``"Correct Answer"``, ...); we also accept lower/underscore
+    variants so the loader is robust to minor schema drift.
+    """
+    for name in names:
+        if name in row and row[name] is not None:
+            return row[name]
+    raise KeyError(f"none of {names!r} present in GPQA row")
+
+
+def _normalize_gpqa_row(row: dict, idx: int) -> dict:
+    """Normalize one GPQA-Diamond row into ``{problem, answer, unique_id}``.
+
+    GPQA is multiple-choice: ``problem`` is the question followed by four labeled
+    options ``A)/B)/C)/D)`` built from the correct answer plus the three
+    incorrect answers. The options are shuffled with a per-item seed derived from
+    ``unique_id`` so the correct choice is not positionally constant, and
+    ``answer`` is set to the correct option's LETTER.
+    """
+    question = str(_gpqa_field(row, "Question", "question")).strip()
+    correct = str(_gpqa_field(row, "Correct Answer", "correct_answer")).strip()
+    incorrects = [
+        str(
+            _gpqa_field(
+                row, f"Incorrect Answer {i}", f"incorrect_answer_{i}"
+            )
+        ).strip()
+        for i in (1, 2, 3)
+    ]
+    # Prefer the dataset's stable record id; fall back to the row index.
+    unique_id = str(
+        row.get("Record ID") or row.get("record_id") or idx
+    )
+
+    # Deterministic per-item shuffle: seed from the unique_id so ordering is
+    # reproducible across runs but the correct option's position varies by item.
+    seed = int(hashlib.sha256(unique_id.encode("utf-8")).hexdigest(), 16) % (2**32)
+    rng = random.Random(seed)
+    order = list(range(4))  # 0 == correct answer, 1..3 == incorrect answers
+    rng.shuffle(order)
+
+    options = [correct, *incorrects]
+    shuffled = [options[i] for i in order]
+    correct_letter = GPQA_OPTION_LETTERS[order.index(0)]
+    labeled = "\n".join(
+        f"{GPQA_OPTION_LETTERS[i]}) {opt}" for i, opt in enumerate(shuffled)
+    )
+    problem = (
+        f"{question}\n\n{labeled}\n\n"
+        "Please reason step by step, then end your response with your chosen "
+        "option on its own line as 'Answer: X' AND put that same letter in "
+        "\\boxed{X}, where X is exactly one of A, B, C, or D."
+    )
+    return {"problem": problem, "answer": correct_letter, "unique_id": unique_id}
 
 
 def load_benchmark_dataset(dataset: BenchmarkDataset):
+    import datasets
+
     if dataset == BenchmarkDataset.MATH500:
         ds = datasets.load_dataset("HuggingFaceH4/MATH-500")["test"]
     elif dataset == BenchmarkDataset.AIME_2024:
@@ -46,6 +119,27 @@ def load_benchmark_dataset(dataset: BenchmarkDataset):
         ds = ds.cast_column("answer", datasets.Value("string"))
         # remove old columns
         ds = ds.remove_columns(old_column_names)
+    elif dataset == BenchmarkDataset.GPQA_DIAMOND:
+        # Multiple-choice hard-science benchmark (198 items). Normalize each row
+        # into the same {problem, answer, unique_id} schema the run loop consumes;
+        # see _normalize_gpqa_row for the option assembly + seeded shuffle.
+        raw = datasets.load_dataset("Idavidrein/gpqa", "gpqa_diamond")["train"]
+        ds = raw.map(
+            _normalize_gpqa_row,
+            with_indices=True,
+            remove_columns=raw.column_names,
+            # H4.9-QA1 (DEFECT 2): force the normalize transform to re-run every
+            # time instead of loading a possibly-stale ``datasets.map`` cache.
+            # HuggingFace fingerprints ``map`` by hashing the transform, but a
+            # prior run's cache (built from the OLD MCQ prompt) can be served
+            # under default caching, leaving the new "Answer: X AND \\boxed{X}"
+            # prompt INERT on any warm-cache box. ``ITS_CACHE_MODE`` controls a
+            # different (LM-response) cache and cannot bust this one. Disabling
+            # the cache-file load for just this map guarantees the current prompt
+            # reaches the model regardless of on-disk cache state; the transform
+            # is deterministic (per-item seeded shuffle) so the output is stable.
+            load_from_cache_file=False,
+        )
     # add unique_id if it doesn't exist
     if "unique_id" not in ds.column_names:
         ds = ds.map(lambda _, idx: {"unique_id": idx}, with_indices=True)
@@ -66,17 +160,187 @@ def _extract_boxed(s: str) -> str:
     return boxed_matches[-1] if boxed_matches else ""
 
 
+def _extract_choice_letter(response: str) -> str | None:
+    """Extract the chosen multiple-choice letter (A-D) from a model response.
+
+    Tolerant of the common answer formats: ``\\boxed{C}``, ``answer: (B)``,
+    ``The answer is D.``, ``(A)``, or a trailing standalone letter. Returns the
+    upper-cased letter, or ``None`` when no A-D choice can be found.
+    """
+    if not response:
+        return None
+    text = str(response).strip()
+
+    # 1. \boxed{...} — matches the answer convention used in the GPQA prompt.
+    boxed = _extract_boxed(text)
+    if boxed:
+        m = re.search(r"([A-Da-d])", boxed)
+        if m:
+            return m.group(1).upper()
+
+    # 2. explicit "answer" phrasing, e.g. "answer: (B)", "final answer is C".
+    m = re.search(r"answer\b[^A-Da-d]{0,20}?\(?([A-Da-d])\)?", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # 3. an option wrapped in parentheses, e.g. "... hence (D).".
+    paren = re.findall(r"\(([A-Da-d])\)", text)
+    if paren:
+        return paren[-1].upper()
+
+    # 4. fall back to the last standalone A-D token.
+    standalone = re.findall(r"(?<![A-Za-z])([A-Da-d])(?![A-Za-z])", text)
+    if standalone:
+        return standalone[-1].upper()
+
+    return None
+
+
+def grade_response(benchmark: BenchmarkDataset, gold, response) -> bool:
+    """Grade a single model ``response`` against the ``gold`` answer.
+
+    MATH500 / AIME_2024 keep the existing ``math_verify`` path unchanged.
+    GPQA_DIAMOND is multiple-choice and is graded by letter/choice matching —
+    ``math_verify`` is never called on it (choices are letters, not expressions).
+    """
+    if benchmark == BenchmarkDataset.GPQA_DIAMOND:
+        chosen = _extract_choice_letter(response)
+        if chosen is None:
+            return False
+        # gold is the correct letter, but be tolerant if it arrives wrapped.
+        gold_letter = _extract_choice_letter(gold) or str(gold).strip().upper()
+        return chosen == gold_letter
+
+    import math_verify
+
+    return bool(
+        math_verify.verify(
+            math_verify.parse(gold),
+            math_verify.parse(response),
+        )
+    )
+
+
+def _extract_choice_letter_or_empty(response: str) -> str:
+    """Self-consistency vote-key projection for GPQA-Diamond (MCQ).
+
+    Parses the model's OWN generated text for its chosen A-D option (via
+    ``_extract_choice_letter``) and returns that letter as the vote key, or an
+    empty string when no choice is parseable. This makes self-consistency vote
+    over the discrete choices ``{A, B, C, D}`` instead of collapsing every draw
+    into one degenerate empty ``\\boxed{}`` group — Qwen2.5-Math rarely emits
+    ``\\boxed{letter}`` on multiple-choice items, which is why the numeric
+    ``_extract_boxed`` projection produced all-empty keys and no voting occurred.
+
+    Integrity: this reads ONLY the model's response text. It never reads the
+    ground-truth answer key and never hard-codes an answer — it changes only how
+    the model's answer is EXTRACTED FOR VOTING, not how the selected response is
+    graded against gold (``grade_response`` is unchanged).
+    """
+    return _extract_choice_letter(response) or ""
+
+
+def _projection_func_for(benchmark: BenchmarkDataset | None):
+    """Select the self-consistency vote-key projection for a benchmark.
+
+    GPQA-Diamond is multiple-choice: project onto the model's chosen letter so
+    voting ranges over ``{A, B, C, D}``. MATH500 / AIME-2024 (and the default
+    when no benchmark is given) keep the existing numeric ``_extract_boxed`` path
+    completely unchanged.
+    """
+    if benchmark == BenchmarkDataset.GPQA_DIAMOND:
+        return _extract_choice_letter_or_empty
+    return _extract_boxed
+
+
+def _seed_global_random_from_env() -> int | None:
+    """Seed Python's global ``random`` from ``ITS_SEED`` (H4.9 sub-part b).
+
+    The self-consistency plurality tie-break falls back to ``random.choice``
+    (``its_hub/core/algorithms/_sc_voting.py``); that draws from the process-wide
+    ``random`` module, which ``ITS_SEED`` never reached before — only the LM
+    sampling seed / cache key did. Seeding it here makes plurality voting (most
+    visibly on GPQA, where every draw lands in one vote group) REPRODUCIBLE
+    across repeats under a fixed ``ITS_SEED``.
+
+    Returns the applied seed, or ``None`` when ``ITS_SEED`` is unset or invalid —
+    in which case the global RNG is left untouched so the default scored path is
+    byte-identical to today. Seeds only the tie-break RNG; reads no ground truth.
+    """
+    raw = os.environ.get("ITS_SEED")
+    if raw in (None, ""):
+        return None
+    try:
+        seed = int(raw)
+    except ValueError:
+        return None
+    random.seed(seed)
+    return seed
+
+
+def _lm_sampling_seed(resolved_seed: int | None) -> int | None:
+    """Sampling seed to forward to the LM (H4.9-QA1 DEFECT 1).
+
+    ``resolved_seed`` is the value returned by ``_seed_global_random_from_env``
+    (the ``ITS_SEED`` integer, or ``None`` when unset/empty/invalid). Forwarding
+    it into ``OpenAICompatibleLanguageModel(seed=...)`` reaches vLLM
+    ``SamplingParams(seed=...)`` so that temperature>0 generation is
+    REPRODUCIBLE across identical repeats — the missing half of the fix
+    (``_seed_global_random_from_env`` only seeded the plurality tie-break RNG,
+    never the LM draw, so GPQA still swung run-to-run).
+
+    Returns ``None`` (no seed forwarded — byte-identical to baseline) when:
+
+    * ``resolved_seed`` is ``None`` (``ITS_SEED`` unset/empty/invalid): the
+      default MATH500/AIME path is left completely untouched, AND
+    * the H1 verification cache is in ``record``/``replay`` mode: there the
+      recorded draw is the source of determinism, so a live sampling seed is
+      unnecessary and would only perturb the H1 cache key (which includes the
+      seed when set), missing caches recorded without it. Only the ``off``
+      (live) mode — the default and the mode the reproducibility run uses — lets
+      the sampling seed govern the draw.
+
+    Seeds are applied to LIVE generation only; grading, weighting, and slice
+    definitions are never touched.
+    """
+    if resolved_seed is None:
+        return None
+    if os.getenv("ITS_CACHE_MODE", "off") != "off":
+        return None
+    return resolved_seed
+
+
 def init_algorithm(
     alg: ScalingAlgorithm,
     model_name: str,
     rm_name: str,
     rm_device: str,
-    rm_agg_method: AggregationMethod,
-    tokens_per_step: int = None,
+    rm_agg_method: str,
+    tokens_per_step: int | None = None,
+    benchmark: BenchmarkDataset | None = None,
 ):
     if alg == ScalingAlgorithm.SELF_CONSISTENCY:
-        return SelfConsistency(_extract_boxed)
-    elif alg == ScalingAlgorithm.BEAM_SEARCH:
+        # Self-consistency uses no reward model, so return before importing
+        # anything that pulls in reward_hub / vLLM (the ``experimental`` extra).
+        # The vote-key projection is selected PER-BENCHMARK: GPQA-Diamond votes
+        # over the model's chosen A-D letter (so MCQ items produce non-empty vote
+        # groups) while MATH500 / AIME-2024 keep the numeric ``_extract_boxed``
+        # path unchanged (default when no benchmark is supplied).
+        return SelfConsistency(_projection_func_for(benchmark))
+
+    # PRM-based algorithms below. reward_hub / vLLM are imported lazily here so
+    # the self-consistency path above stays importable without the experimental
+    # extra. ``rm_agg_method`` arrives as a raw string and is resolved to a
+    # reward_hub ``AggregationMethod`` only now that we know a PRM is needed.
+    from reward_hub.base import AggregationMethod
+
+    from its_hub.core.reward_models.local_vllm_prm import (
+        LocalVllmProcessRewardModel,
+    )
+
+    rm_agg_method = AggregationMethod(rm_agg_method)
+
+    if alg == ScalingAlgorithm.BEAM_SEARCH:
         if tokens_per_step is not None:
             # Use new tokens_per_step approach for easier usage
             sg = StepGeneration(
@@ -189,10 +453,15 @@ def display_results(df: pd.DataFrame):
 )
 @click.option(
     "--rm_agg_method",
-    type=click.Choice([e.value for e in AggregationMethod]),
+    type=str,
     default="model",
-    callback=lambda ctx, param, value: AggregationMethod(value),
-    help="aggregation method to use for reward model",
+    # Kept as a raw string at parse time and only converted to a reward_hub
+    # ``AggregationMethod`` at point of use (inside ``init_algorithm``, for the
+    # PRM-based algorithms). Click runs option callbacks even on default values,
+    # so importing reward_hub in a callback here would crash arg-parsing on boxes
+    # without the ``experimental`` extra — even for self-consistency, which never
+    # touches a reward model.
+    help="aggregation method to use for reward model (from reward_hub AggregationMethod)",
 )
 @click.option(
     "--alg",
@@ -255,7 +524,7 @@ def main(
     api_key: str,
     rm_name: str,
     rm_device: str,
-    rm_agg_method: AggregationMethod,
+    rm_agg_method: str,
     alg: ScalingAlgorithm,
     subset: str,
     budgets: list,
@@ -267,11 +536,29 @@ def main(
     display_only: bool,
     tokens_per_step: int,
 ):
+    import pandas as pd
+    from tqdm import tqdm
+
     # print all arguments using click context
     ctx = click.get_current_context()
     print("running with arguments:")
     for param_name, param_value in ctx.params.items():
         print(f"  {param_name}: {param_value}")
+
+    # H4.9(b): thread ITS_SEED into Python's global ``random`` module so the
+    # plurality vote tie-break (``random.choice`` in the self-consistency
+    # selector, reachable from self_consistency.py) is REPRODUCIBLE across
+    # repeats under a fixed seed. eval/score.py forwards ITS_SEED into this
+    # subprocess's environment when a seed is requested; when ITS_SEED is unset
+    # or invalid the global RNG is left untouched, so the default scored path is
+    # byte-identical to today. This seeds only the tie-break RNG — it does not
+    # read ground truth, change grading, or alter the composite weighting.
+    #
+    # H4.9-QA1 (DEFECT 1): capture the resolved seed so it can ALSO be threaded
+    # into the LM sampling seed below. Seeding only the tie-break RNG left LM
+    # generation unseeded, so GPQA still varied run-to-run at temperature>0;
+    # forwarding the seed to vLLM SamplingParams makes the live path reproducible.
+    resolved_seed = _seed_global_random_from_env()
 
     if eval_expected_pass_at_one:
         assert alg in [
@@ -287,7 +574,7 @@ def main(
         or alg == ScalingAlgorithm.ENTROPIC_PARTICLE_FILTERING
     ):
         rm_name_dashed = rm_name.replace("/", "-")
-        alg_str = f"{alg.value}-{rm_name_dashed}-{rm_agg_method.value}"
+        alg_str = f"{alg.value}-{rm_name_dashed}-{rm_agg_method}"
         # Add tokens_per_step to filename if specified
         if tokens_per_step is not None:
             alg_str += f"-tokens{tokens_per_step}"
@@ -347,6 +634,11 @@ def main(
             temperature=temperature,
             max_completion_tokens=max_completion_tokens,
             max_concurrency=max_concurrency,
+            # H4.9-QA1 (DEFECT 1): reproducible LM sampling. None (ITS_SEED unset
+            # or a record/replay cache mode) → no ``seed`` key in the request
+            # payload → byte-identical to baseline; an int → vLLM
+            # SamplingParams(seed=...) → deterministic generation across repeats.
+            seed=_lm_sampling_seed(resolved_seed),
         )
 
     print("initializing algorithm...")
@@ -357,6 +649,7 @@ def main(
         rm_device,
         rm_agg_method,
         tokens_per_step,
+        benchmark=benchmark,
     )
 
     # ensure output directory exists
@@ -428,9 +721,10 @@ def main(
                 if does_eval:
                     if eval_expected_pass_at_one:
                         c = [
-                            math_verify.verify(
-                                math_verify.parse(x["answer"]),
-                                math_verify.parse(extract_content_from_lm_response(y) if isinstance(y, dict) else y),
+                            grade_response(
+                                benchmark,
+                                x["answer"],
+                                extract_content_from_lm_response(y) if isinstance(y, dict) else y,
                             )
                             for y in row["responses"]
                         ]
@@ -438,9 +732,8 @@ def main(
                         row["correct"] = np.dot(p, c)
                     else:
                         response_content = extract_content_from_lm_response(row["response"]) if isinstance(row["response"], dict) else row["response"]
-                        row["correct"] = math_verify.verify(
-                            math_verify.parse(x["answer"]),
-                            math_verify.parse(response_content),
+                        row["correct"] = grade_response(
+                            benchmark, x["answer"], response_content
                         )
                 rows.append(row)
 

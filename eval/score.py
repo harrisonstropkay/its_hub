@@ -11,9 +11,12 @@ You can edit this file to add custom evals or adjust weights.
 Once edited, it becomes a Tier 1 (explicit) eval — the factory will use it as-is.
 """
 
+import argparse
 import json
+import os
 import subprocess
 import sys
+
 
 def eval_tests() -> dict:
     """Run test suite: uv run pytest -v"""
@@ -198,11 +201,1065 @@ def eval_observability() -> dict:
     return {"name": "observability", "score": round(score, 3), "weight": 0.10,
             "passed": score >= 0.3, "details": details}
 
-# Register all eval functions here.
+# --- Project eval: composite math + science accuracy ------------------------
+#
+# Disjoint dev/test subsets per benchmark (so the research loop never tunes on
+# the scored items). Only the *test* slices below are scored here; the *dev*
+# slices are reserved for the loop to iterate against:
+#
+#     benchmark      test slice   dev slice (reserved for the loop)
+#     -----------    ----------   ---------------------------------
+#     MATH500        ':20'        '20:60'
+#     GPQA-Diamond   ':20'        '20:60'
+#     AIME-2024      ':15'        '15:30'   (AIME-2024 has only 30 items)
+#
+# The scoring path drives benchmarking/benchmark.py at the *subprocess* boundary
+# so it never imports algorithm-editable code — closing the classic leakage
+# channel. benchmarking/** and this scoring path are FIXED surfaces during the
+# research loop (see factory.md).
+
+_ACCURACY_WEIGHT = 0.50
+_ALLOWED_BUDGETS = {4, 8}
+_DEFAULT_TIMEOUT = 1200  # seconds, per benchmark subprocess
+
+# (benchmark CLI value, held-out TEST subset)
+_ACCURACY_BENCHMARKS = [
+    ("math500", ":20"),
+    ("aime-2024", ":15"),
+    ("gpqa-diamond", ":20"),
+]
+
+# --- H3: multi-run confidence intervals + hardware/version stamping ----------
+#
+# eval_accuracy honors ITS_EVAL_RUNS=N (default 1) to run each scored TEST slice
+# N times with DETERMINISTICALLY-DERIVED per-run seeds (master + run_index,
+# threaded to the benchmark subprocess LM via the H2 ITS_SEED channel), then
+# reports per-dimension mean AND sample stddev. When a dimension's stddev
+# exceeds the sampling noise floor it is FLAGGED in `details` only — this is
+# purely informational and NEVER changes the score, weight, or pass/fail gate.
+# The composite score is computed from the per-benchmark MEANS, so at the
+# default ITS_EVAL_RUNS=1 the mean over one run == that run and the score/weight/
+# passed are byte-identical to the pre-H3 single-run behavior.
+_ACCURACY_NOISE_FLOOR = 0.04  # sampling-noise stddev cutoff (report-only flag)
+_ACCURACY_DEFAULT_RUNS = 1
+
+
+def _get_eval_runs() -> int:
+    """Read ITS_EVAL_RUNS (default 1). Invalid / <1 values degrade to 1."""
+    raw = os.environ.get("ITS_EVAL_RUNS")
+    if raw in (None, ""):
+        return _ACCURACY_DEFAULT_RUNS
+    try:
+        n = int(raw)
+    except ValueError:
+        return _ACCURACY_DEFAULT_RUNS
+    return n if n >= 1 else _ACCURACY_DEFAULT_RUNS
+
+
+def _get_master_seed() -> int | None:
+    """Read the master seed from ITS_SEED (H2). None when unset/invalid.
+
+    None means "do not inject a seed" so the single-run default path inherits
+    the environment exactly as today (byte-identical behavior).
+    """
+    raw = os.environ.get("ITS_SEED")
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _derive_run_seeds(master_seed: int, n: int) -> list[int]:
+    """Deterministic per-run seed sequence: master_seed + run_index.
+
+    Pure function — the same (master_seed, n) always yields the same sequence,
+    so a recorded multi-run eval is reproducible. Threaded into each benchmark
+    subprocess via ITS_SEED (H2 seed forwarding to vLLM SamplingParams(seed)).
+    """
+    return [master_seed + i for i in range(n)]
+
+
+def _sample_stddev(values: list[float]) -> float:
+    """Sample standard deviation (ddof=1). 0.0 for fewer than two values.
+
+    Hand-rolled to keep the scoring path free of a scipy/numpy import here; the
+    stddev is report-only and never enters the scored composite.
+    """
+    k = len(values)
+    if k < 2:
+        return 0.0
+    mean = sum(values) / k
+    var = sum((v - mean) ** 2 for v in values) / (k - 1)
+    return var**0.5
+
+
+def _hw_version_metadata() -> dict:
+    """Best-effort hardware/library stamp for the benchmark run (H3).
+
+    Every import/probe is guarded so a missing package or absent GPU degrades to
+    'unknown'/None and NEVER raises. Stamped into the accuracy `details` so each
+    recorded score is self-describing and auditable across hardware/versions.
+    """
+    meta = {
+        "vllm_version": "unknown",
+        "torch_version": "unknown",
+        "cuda_version": None,
+        "gpu_model": None,
+        # The batch-invariant flag pairs with H2 seeding for seed-level
+        # reproducibility; recorded verbatim (None when unset).
+        "vllm_batch_invariant": os.environ.get("VLLM_BATCH_INVARIANT"),
+    }
+    try:
+        import vllm  # type: ignore
+
+        meta["vllm_version"] = getattr(vllm, "__version__", "unknown") or "unknown"
+    except Exception:
+        pass
+    try:
+        import torch  # type: ignore
+
+        meta["torch_version"] = getattr(torch, "__version__", "unknown") or "unknown"
+        meta["cuda_version"] = getattr(getattr(torch, "version", None), "cuda", None)
+        try:
+            if torch.cuda.is_available():
+                meta["gpu_model"] = torch.cuda.get_device_name(0)
+        except Exception:
+            meta["gpu_model"] = None
+    except Exception:
+        pass
+    return meta
+
+
+def _fmt_hw_metadata(meta: dict) -> str:
+    """Compact single-line rendering of _hw_version_metadata() for `details`."""
+
+    def _s(v):
+        return "unknown" if v is None else str(v)
+
+    return (
+        f"hw: vllm={_s(meta.get('vllm_version'))} "
+        f"torch={_s(meta.get('torch_version'))} "
+        f"cuda={_s(meta.get('cuda_version'))} "
+        f"gpu={_s(meta.get('gpu_model'))} "
+        f"batch_invariant={_s(meta.get('vllm_batch_invariant'))}"
+    )
+
+
+def _accuracy_result(score: float, passed: bool, details: str) -> dict:
+    return {
+        "name": "accuracy",
+        "score": round(float(score), 4),
+        "weight": _ACCURACY_WEIGHT,
+        "passed": bool(passed),
+        "details": details,
+    }
+
+
+def _endpoint_reachable(endpoint: str) -> bool:
+    """Best-effort check that an OpenAI-compatible endpoint is up. Never raises."""
+    import urllib.error
+    import urllib.request
+
+    url = endpoint.rstrip("/") + "/models"
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer NO_API_KEY"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status < 500
+    except urllib.error.HTTPError:
+        # The server responded (e.g. 401/404) — it is reachable.
+        return True
+    except Exception:
+        return False
+
+
+def _accuracy_from_jsonl(path: str, budget: int) -> float | None:
+    """Mean of the `correct` column for `budget` rows in a benchmark jsonl.
+
+    Returns None when the file has no usable rows (parsed manually to avoid a
+    pandas dependency in the scoring path)."""
+    scores = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if row.get("budget") != budget:
+                    continue
+                c = row.get("correct")
+                if c is None:
+                    continue
+                scores.append(float(c))
+    except (OSError, ValueError):
+        return None
+    if not scores:
+        return None
+    return sum(scores) / len(scores)
+
+
+def _run_benchmarks_once(
+    *,
+    endpoint: str,
+    model: str,
+    api_key: str,
+    alg: str,
+    budget: int,
+    timeout_s: int,
+    tokens_per_step: str | None,
+    repo_root: str,
+    bench_script: str,
+    seed: int | None,
+) -> tuple[dict[str, float | None], list[str]]:
+    """Run every scored benchmark slice ONCE and return (accuracies, notes).
+
+    This is the pre-H3 single-run sweep, extracted verbatim so the multi-run
+    loop can call it N times. When ``seed`` is not None it is threaded to the
+    benchmark subprocess via the ITS_SEED env var (H2 → SamplingParams(seed=…));
+    when it is None the subprocess is launched EXACTLY as before (inheriting the
+    ambient environment with no ``env=`` override), preserving byte-identical
+    single-run behavior.
+    """
+    import glob
+    import tempfile
+
+    accuracies: dict[str, float | None] = {}
+    notes: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="its-accuracy-") as out_dir:
+        for bench, subset in _ACCURACY_BENCHMARKS:
+            cmd = [
+                sys.executable,
+                bench_script,
+                "--benchmark", bench,
+                "--model_name", model,
+                "--endpoint", endpoint,
+                "--api_key", api_key,
+                "--alg", alg,
+                "--subset", subset,
+                "--budgets", str(budget),
+                "--output_dir", out_dir,
+                "--is_async",
+                "--does_eval",
+                "--force_run",
+            ]
+            if tokens_per_step:
+                cmd += ["--tokens_per_step", tokens_per_step]
+            run_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": timeout_s,
+                "cwd": repo_root,
+            }
+            # Only override the child env when a seed is being injected — leaving
+            # the None path identical to the pre-H3 call keeps the default
+            # single-run behavior byte-identical.
+            if seed is not None:
+                child_env = dict(os.environ)
+                child_env["ITS_SEED"] = str(seed)
+                run_kwargs["env"] = child_env
+            try:
+                subprocess.run(cmd, **run_kwargs)
+            except subprocess.TimeoutExpired:
+                notes.append(f"{bench}: timed out after {timeout_s}s")
+                accuracies[bench] = None
+                continue
+            except Exception as e:  # never let a subprocess failure crash scoring
+                notes.append(f"{bench}: run error ({type(e).__name__})")
+                accuracies[bench] = None
+                continue
+
+            matches = glob.glob(os.path.join(out_dir, f"*{bench}.jsonl"))
+            acc = _accuracy_from_jsonl(matches[0], budget) if matches else None
+            accuracies[bench] = acc
+            if acc is None:
+                notes.append(f"{bench}: no usable rows")
+
+    return accuracies, notes
+
+
+def eval_accuracy() -> dict:
+    """Composite math + science accuracy via the benchmark harness.
+
+    score = clamp(0.5 * mean(MATH500_acc, AIME_acc) + 0.5 * GPQA_acc, 0, 1)
+
+    Configuration (all optional):
+      ITS_ENDPOINT / OPENAI_ENDPOINT  OpenAI-compatible base url (required to run)
+      ITS_MODEL                       model name (default Qwen/Qwen2.5-Math-7B-Instruct)
+      ITS_API_KEY / OPENAI_API_KEY    api key (default NO_API_KEY)
+      ITS_ALG                         scaling algorithm (default self-consistency)
+      ITS_BUDGET                      per-experiment budget, must be in {4, 8} (default 4)
+      ITS_EVAL_TIMEOUT                hard per-benchmark wall-clock cap (default 1200s)
+      ITS_TOKENS_PER_STEP             optional fixed tokens-per-step for step algorithms
+      ITS_EVAL_RUNS                   number of scored repetitions (H3, default 1)
+      ITS_SEED                        master seed; per-run seeds = master + run_index
+
+    Multi-run confidence intervals (H3): with ITS_EVAL_RUNS=N>1 each scored
+    slice is run N times with deterministically-derived per-run seeds; the
+    per-dimension mean AND sample stddev are reported, and a stddev above the
+    ``_ACCURACY_NOISE_FLOOR`` is FLAGGED in details ("signal vs sampling"). The
+    flag is report-only — the composite score is computed from the per-benchmark
+    MEANS and the weights/slices/gate are untouched, so the default N=1 path is
+    behavior-identical to the pre-H3 single run. The run is also stamped with
+    hardware/library versions for auditability.
+
+    Graceful degradation: if no endpoint is set/reachable, returns score=0.0,
+    passed=False with clear details and NEVER raises. A TimeoutExpired on any
+    benchmark yields a partial score with the timeout noted in details.
+    """
+    endpoint = os.environ.get("ITS_ENDPOINT") or os.environ.get("OPENAI_ENDPOINT")
+    if not endpoint:
+        return _accuracy_result(
+            0.0, False, "no model endpoint reachable — set ITS_ENDPOINT"
+        )
+
+    # Fixed budget allowlist — reject anything outside it (anti cost-blowup).
+    raw_budget = os.environ.get("ITS_BUDGET", "4")
+    try:
+        budget = int(raw_budget)
+    except ValueError:
+        budget = None
+    if budget not in _ALLOWED_BUDGETS:
+        return _accuracy_result(
+            0.0,
+            False,
+            f"ITS_BUDGET must be one of {sorted(_ALLOWED_BUDGETS)} (got {raw_budget!r})",
+        )
+
+    try:
+        timeout_s = int(os.environ.get("ITS_EVAL_TIMEOUT", str(_DEFAULT_TIMEOUT)))
+    except ValueError:
+        timeout_s = _DEFAULT_TIMEOUT
+
+    if not _endpoint_reachable(endpoint):
+        return _accuracy_result(
+            0.0,
+            False,
+            f"endpoint set ({endpoint}) but unreachable — is vLLM serving?",
+        )
+
+    model = os.environ.get("ITS_MODEL", "Qwen/Qwen2.5-Math-7B-Instruct")
+    api_key = (
+        os.environ.get("ITS_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or "NO_API_KEY"
+    )
+    alg = os.environ.get("ITS_ALG", "self-consistency")
+    tokens_per_step = os.environ.get("ITS_TOKENS_PER_STEP")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bench_script = os.path.join(repo_root, "benchmarking", "benchmark.py")
+
+    # H3 run count + deterministic per-run seed sequence. At the default N=1 with
+    # no explicit ITS_SEED, `seeds = [None]` so the single subprocess sweep is
+    # launched exactly as pre-H3 (env inherited, no injection) — byte-identical.
+    n_runs = _get_eval_runs()
+    master_seed = _get_master_seed()
+    if n_runs == 1 and master_seed is None:
+        seeds: list[int | None] = [None]
+    else:
+        base = master_seed if master_seed is not None else 0
+        seeds = list(_derive_run_seeds(base, n_runs))
+
+    per_run: list[dict[str, float | None]] = []
+    notes: list[str] = []
+    for run_idx, seed in enumerate(seeds):
+        accs, run_notes = _run_benchmarks_once(
+            endpoint=endpoint,
+            model=model,
+            api_key=api_key,
+            alg=alg,
+            budget=budget,
+            timeout_s=timeout_s,
+            tokens_per_step=tokens_per_step,
+            repo_root=repo_root,
+            bench_script=bench_script,
+            seed=seed,
+        )
+        per_run.append(accs)
+        prefix = f"run{run_idx}: " if len(seeds) > 1 else ""
+        notes.extend(prefix + n for n in run_notes)
+
+    # Aggregate to per-benchmark mean + sample stddev across the usable runs.
+    means: dict[str, float | None] = {}
+    stddevs: dict[str, float] = {}
+    for bench, _ in _ACCURACY_BENCHMARKS:
+        vals = [r[bench] for r in per_run if r.get(bench) is not None]
+        means[bench] = (sum(vals) / len(vals)) if vals else None
+        stddevs[bench] = _sample_stddev(vals)
+
+    math_parts = [
+        means[b] for b in ("math500", "aime-2024") if means.get(b) is not None
+    ]
+    math_acc = sum(math_parts) / len(math_parts) if math_parts else None
+    gpqa_acc = means.get("gpqa-diamond")
+
+    hw_meta = _hw_version_metadata()
+
+    # No usable results at all → treat as an unreachable/degraded run.
+    if math_acc is None and gpqa_acc is None:
+        detail = "endpoint set but no usable results"
+        if notes:
+            detail += " — " + "; ".join(notes)
+        detail += " | " + _fmt_hw_metadata(hw_meta)
+        return _accuracy_result(0.0, False, detail)
+
+    # Composite is computed from the per-benchmark MEANS. At N=1 mean == the
+    # single run, so this reproduces the pre-H3 score/weight/gate exactly.
+    score = 0.5 * (math_acc or 0.0) + 0.5 * (gpqa_acc or 0.0)
+    score = max(0.0, min(1.0, score))
+    complete = all(means.get(b) is not None for b, _ in _ACCURACY_BENCHMARKS)
+
+    def _fmt(v):
+        return f"{v:.3f}" if v is not None else "n/a"
+
+    details = (
+        f"budget={budget} alg={alg} | "
+        f"math500={_fmt(means.get('math500'))} "
+        f"aime={_fmt(means.get('aime-2024'))} "
+        f"gpqa={_fmt(gpqa_acc)} | "
+        f"math_acc={_fmt(math_acc)} science_acc={_fmt(gpqa_acc)} "
+        f"-> score={score:.4f}"
+    )
+
+    # H3 multi-run reporting: per-dimension stddev + noise-floor flag. This is
+    # informational ONLY and does not touch score/weight/passed above.
+    if len(seeds) > 1:
+        sd_bits = [
+            f"{b}={stddevs[b]:.3f}" for b, _ in _ACCURACY_BENCHMARKS if means.get(b) is not None
+        ]
+        details += f" | runs={len(seeds)} stddev[{' '.join(sd_bits)}]"
+        flags = [
+            f"signal vs sampling: {b} stddev={stddevs[b]:.3f} > "
+            f"{_ACCURACY_NOISE_FLOOR:.2f} noise floor"
+            for b, _ in _ACCURACY_BENCHMARKS
+            if means.get(b) is not None and stddevs[b] > _ACCURACY_NOISE_FLOOR
+        ]
+        if flags:
+            details += " | " + "; ".join(flags)
+
+    if notes:
+        details += " | " + "; ".join(notes)
+
+    details += " | " + _fmt_hw_metadata(hw_meta)
+
+    return _accuracy_result(score, complete and score > 0.0, details)
+
+
+# --- Integrity gate: eval_leakage_check() (H4, exp_id=9) --------------------
+#
+# A quantitative training-data-contamination gate that measures VERBATIM RECALL
+# of benchmark text (memorization), not answer correctness (capability). It
+# samples a handful of items with a SEEDED rng (reproducible: same seed -> same
+# items) and DISPATCHES on the benchmark type:
+#
+#   TRACK A — open-ended (math500, aime-2024): GUIDED-INSTRUCTION QUIZ COMPLETION
+#     (Golchin & Surdeanu, arXiv:2308.08493). Split each problem at its ~50%
+#     char boundary; ask the model to reproduce the exact continuation of the
+#     prefix (a) WITH dataset-name context and (b) WITHOUT it. Score verbatim
+#     overlap with a self-contained LCS-based ROUGE-L F1. Contamination is a
+#     baseline delta: mean(rougeL_with) - mean(rougeL_without) > delta_threshold.
+#     The baseline cancels out mere fluency, so the signal reflects memorization.
+#
+#   TRACK B — multiple-choice (gpqa-diamond): TS-GUESSING MASKED WRONG-OPTION
+#     RECONSTRUCTION (arXiv:2311.09783). The gold letter (A/B/C/D) appears in
+#     essentially any English text, so it is USELESS as a signal. Instead we mask
+#     a WRONG option's *text* (never shown in the prompt) and ask the model to
+#     reproduce it verbatim; a clean model cannot guess it, a contaminated one
+#     recites it. Contamination is a normalized exact-match rate > threshold.
+#
+# Matching is EXACT-EQUALITY / boundary-aware only — never `gold in response`
+# substring containment, which inverted the old gate on short/single-letter
+# golds (a clean model scored rate=1.000 on GPQA). See adversarial-qa.md.
+#
+# This dimension is PURELY ADDITIVE:
+#   * It is NOT in `EVALS` (the scored bundle) and carries weight 0.0, so it can
+#     never perturb the composite score or the accuracy slices.
+#   * It never imports gold answers into `its_hub/core` — it lives in `eval/`
+#     and reads the dataset only through `benchmarking/benchmark.py`, the same
+#     fixed surface the accuracy path drives at the subprocess boundary.
+
+_LEAKAGE_WEIGHT = 0.0  # informational only — deliberately outside the composite
+_LEAKAGE_DEFAULT_N = 10
+_LEAKAGE_DEFAULT_DELTA_THRESHOLD = 0.3  # Track A: ROUGE-L baseline-delta cutoff
+_LEAKAGE_DEFAULT_EM_THRESHOLD = 0.5  # Track B: masked-option exact-match rate cutoff
+_LEAKAGE_DEFAULT_SEED = 0
+_LEAKAGE_DEFAULT_BENCHMARK = "math500"
+
+# Benchmarks whose items are multiple-choice (Track B). Everything else is
+# treated as open-ended (Track A).
+_LEAKAGE_MC_BENCHMARKS = {"gpqa-diamond", "gpqa", "gpqa_diamond"}
+_LEAKAGE_DISPLAY_NAMES = {
+    "math500": "MATH500",
+    "aime-2024": "AIME 2024",
+    "gpqa-diamond": "GPQA-Diamond",
+}
+
+
+def _leakage_result(score: float, passed: bool, details: str) -> dict:
+    """Standard eval-dict for the leakage gate (mirrors _accuracy_result)."""
+    return {
+        "name": "leakage_check",
+        "score": round(float(score), 4),
+        "weight": _LEAKAGE_WEIGHT,
+        "passed": bool(passed),
+        "details": details,
+    }
+
+
+def _leakage_track_for(benchmark: str) -> str:
+    """Return 'mc' for multiple-choice benchmarks, else 'open'."""
+    return "mc" if str(benchmark).lower() in _LEAKAGE_MC_BENCHMARKS else "open"
+
+
+def _leakage_display_name(benchmark: str) -> str:
+    """Human dataset name used in the WITH-context probe framing."""
+    return _LEAKAGE_DISPLAY_NAMES.get(str(benchmark).lower(), str(benchmark))
+
+
+# --- verbatim-overlap + answer-matching helpers -----------------------------
+#
+# These REPLACE the removed `_leakage_exact_match` substring test. Matching is
+# always exact-equality (after normalization) or word-boundary — never raw
+# substring containment.
+
+
+def _lcs_length(a: list[str], b: list[str]) -> int:
+    """Length of the longest common subsequence of two token lists (O(n*m))."""
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return 0
+    prev_row = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur_row = [0] * (m + 1)
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            if ai == b[j - 1]:
+                cur_row[j] = prev_row[j - 1] + 1
+            elif prev_row[j] >= cur_row[j - 1]:
+                cur_row[j] = prev_row[j]
+            else:
+                cur_row[j] = cur_row[j - 1]
+        prev_row = cur_row
+    return prev_row[m]
+
+
+def _rouge_l_f1(reference: str, candidate: str) -> float:
+    """Self-contained ROUGE-L F1 (LCS-based) over lower-cased whitespace tokens.
+
+    No external dependency (the `rouge_score` package is not vendored). Returns
+    0.0 when either side is empty. This measures verbatim/ordered overlap, which
+    is exactly the recall signal a contaminated completion produces.
+    """
+    ref = str(reference).lower().split()
+    cand = str(candidate).lower().split()
+    if not ref or not cand:
+        return 0.0
+    lcs = _lcs_length(ref, cand)
+    if lcs == 0:
+        return 0.0
+    precision = lcs / len(cand)
+    recall = lcs / len(ref)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _leakage_extract_answer(response: str) -> str:
+    """Extract a final answer: the last ``\\boxed{...}`` or the final non-empty line."""
+    import re
+
+    if not response:
+        return ""
+    text = str(response)
+    boxed = re.findall(r"\\boxed\{([^{}]+(?:\{[^{}]*\}[^{}]*)*)\}", text)
+    if boxed:
+        return boxed[-1].strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def _normalize_math_answer(ans: str) -> str:
+    """Normalize a math answer for exact comparison.
+
+    Lower-cases, unwraps ``\\text{}``/``\\boxed{}``, and strips ``$``, commas,
+    and grouping symbols so equivalent renderings compare equal.
+    """
+    import re
+
+    s = str(ans).lower()
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\boxed\{([^{}]*)\}", r"\1", s)
+    s = s.replace("$", "").replace(",", "")
+    s = re.sub(r"[(){}\[\]]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _normalize_option_text(text: str) -> str:
+    """Normalize an MC option for exact match: lower-case, collapse ws, strip trailing punctuation."""
+    import re
+
+    s = re.sub(r"\s+", " ", str(text)).strip().lower()
+    return s.strip(" \t\n.,;:!?")
+
+
+def _word_boundary_match(gold: str, response: str) -> bool:
+    """True when the normalized gold appears as a whole token in the response.
+
+    Uses word-boundary anchoring (never raw substring), so single-digit golds do
+    NOT match incidentally inside longer numbers or words.
+    """
+    import re
+
+    g = _normalize_math_answer(gold)
+    if not g:
+        return False
+    pattern = rf"(?<!\w){re.escape(g)}(?!\w)"
+    return re.search(pattern, _normalize_math_answer(response)) is not None
+
+
+def _parse_mc_problem(problem: str) -> tuple[str, dict]:
+    """Split a GPQA-style problem into (question_stem, {letter: option_text}).
+
+    The loader (benchmarking/benchmark.py::_normalize_gpqa_row) builds the
+    problem as ``<question>\\n\\nA) ..\\nB) ..\\nC) ..\\nD) ..\\n\\nPlease reason
+    ...``. We parse the ``X)`` option lines out and drop the trailing boxed-answer
+    instruction so the reconstructed prompt can mask an option cleanly. Returns
+    an empty options dict when nothing parseable is found (caller then skips).
+    """
+    import re
+
+    opt_re = re.compile(r"^\s*([A-D])\)\s*(.*)$")
+    stem_lines: list[str] = []
+    options: dict[str, str] = {}
+    current: str | None = None
+    seen_option = False
+    for line in str(problem).splitlines():
+        m = opt_re.match(line)
+        if m:
+            letter = m.group(1).upper()
+            options[letter] = m.group(2).strip()
+            current = letter
+            seen_option = True
+            continue
+        if not seen_option:
+            stem_lines.append(line)
+            continue
+        stripped = line.strip()
+        if not stripped:
+            current = None
+            continue
+        low = stripped.lower()
+        if low.startswith("please reason") or "\\boxed" in stripped or "put the letter" in low:
+            current = None
+            continue
+        if current is not None:  # continuation of a multi-line option
+            options[current] = (options[current] + " " + stripped).strip()
+    return "\n".join(stem_lines).strip(), options
+
+
+def _leakage_load_items(benchmark: str) -> list[dict]:
+    """Load {problem, answer, unique_id} items for a benchmark.
+
+    Loads `benchmarking/benchmark.py` by path (it is not an importable package)
+    so this stays outside `its_hub/core`. Raises on any failure; callers degrade
+    gracefully.
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bench_path = os.path.join(repo_root, "benchmarking", "benchmark.py")
+    spec = importlib.util.spec_from_file_location("its_leakage_benchmark", bench_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    ds_enum = module.BenchmarkDataset(benchmark)
+    ds = module.load_benchmark_dataset(ds_enum)
+    return [
+        {
+            "problem": str(row["problem"]),
+            "answer": str(row["answer"]),
+            "unique_id": str(row.get("unique_id", "")),
+        }
+        for row in ds
+    ]
+
+
+def _leakage_construct_lm():
+    """Build an LM from env (mirrors eval_accuracy) or return None if unset.
+
+    Uses temperature=0 and forwards the H2 seed (ITS_SEED) for a reproducible
+    recall probe. Never raises — returns None on any construction failure. The
+    caller (`eval_leakage_check`) is responsible for `close()`-ing an LM built
+    here so no aiohttp client session is leaked.
+    """
+    endpoint = os.environ.get("ITS_ENDPOINT") or os.environ.get("OPENAI_ENDPOINT")
+    if not endpoint:
+        return None
+    try:
+        from its_hub import OpenAICompatibleLanguageModel
+
+        model = os.environ.get("ITS_MODEL", "Qwen/Qwen2.5-Math-7B-Instruct")
+        api_key = (
+            os.environ.get("ITS_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or "NO_API_KEY"
+        )
+        seed_env = os.environ.get("ITS_SEED")
+        seed = int(seed_env) if seed_env not in (None, "") else None
+        return OpenAICompatibleLanguageModel(
+            endpoint=endpoint,
+            api_key=api_key,
+            model_name=model,
+            temperature=0.0,
+            max_completion_tokens=256,
+            seed=seed,
+        )
+    except Exception:
+        return None
+
+
+def _open_probe_prompt_with_context(benchmark: str, prefix: str) -> str:
+    """Track A WITH-context probe: name the dataset and ask for the continuation.
+
+    Never includes the held-out continuation — only the prefix is shown.
+    """
+    name = _leakage_display_name(benchmark)
+    return (
+        "You are being audited for benchmark contamination. The text below is "
+        f"the first part of a problem from the {name} benchmark's test split. "
+        "From memory, reproduce the EXACT continuation of this problem as it "
+        "appears in the benchmark, word for word. Do NOT solve it and do NOT "
+        "explain — output only the verbatim continuation that follows the "
+        f"given prefix.\n\nPrefix:\n{prefix}\n\nExact continuation:"
+    )
+
+
+def _open_probe_prompt_no_context(prefix: str) -> str:
+    """Track A baseline probe: identical prefix, NO dataset/benchmark framing."""
+    return (
+        "Continue the following text. Output only the continuation, with no "
+        f"explanation.\n\n{prefix}"
+    )
+
+
+def _mc_probe_prompt(
+    benchmark: str,
+    stem: str,
+    options: dict,
+    correct_letter: str,
+    masked_letter: str,
+) -> str:
+    """Track B (TS-Guessing) probe: mask one WRONG option's text and ask for it.
+
+    The masked option's text is NEVER shown (that is the memorization target).
+    The correct letter is stated and the other options are shown verbatim.
+    """
+    name = _leakage_display_name(benchmark)
+    lines = []
+    for letter in sorted(options):
+        if letter == masked_letter:
+            lines.append(f"{letter}) [MASK]")
+        else:
+            lines.append(f"{letter}) {options[letter]}")
+    opts_block = "\n".join(lines)
+    return (
+        "You are being audited for benchmark contamination. Below is a "
+        f"multiple-choice question from the {name} benchmark's test split. The "
+        f"correct answer is option {correct_letter}. One of the other options "
+        "has been replaced with [MASK]. From memory, reproduce the EXACT "
+        f"original text of option {masked_letter} as it appears in the "
+        "benchmark. Output ONLY that option's text — no explanation, no letter "
+        "label, and no restatement of the question.\n\n"
+        f"Question:\n{stem}\n\nOptions:\n{opts_block}\n\n"
+        f"Exact text of option {masked_letter}:"
+    )
+
+
+def _leakage_call_lm(lm, prompt: str) -> str:
+    """Send a single probe and return the model's text content.
+
+    Supports both the async `agenerate_single` interface (the real
+    OpenAICompatibleLanguageModel) and a sync `generate` (convenient for mocks).
+    """
+    messages = [{"role": "user", "content": prompt}]
+    if hasattr(lm, "agenerate_single"):
+        import asyncio
+
+        async def _run():
+            return await lm.agenerate_single(messages)
+
+        result = asyncio.run(_run())
+    elif hasattr(lm, "generate"):
+        result = lm.generate(messages)
+    else:
+        raise TypeError("lm must expose `agenerate_single` (async) or `generate`")
+
+    if isinstance(result, dict):
+        return result.get("content") or ""
+    return str(result)
+
+
+def _leakage_close_lm(lm) -> None:
+    """Best-effort close of an LM we constructed (avoids aiohttp session leaks)."""
+    close = getattr(lm, "close", None)
+    if close is None:
+        return
+    try:
+        import asyncio
+        import inspect
+
+        if inspect.iscoroutinefunction(close):
+            asyncio.run(close())
+        else:
+            close()
+    except Exception:
+        pass
+
+
+def _leakage_check_open(
+    lm, benchmark: str, sampled: list[dict], n: int, threshold: float | None, seed: int
+) -> dict:
+    """Track A: guided-instruction quiz completion with a WITH/WITHOUT baseline."""
+    thr = _LEAKAGE_DEFAULT_DELTA_THRESHOLD if threshold is None else threshold
+    with_scores: list[float] = []
+    no_scores: list[float] = []
+    errors = 0
+    for item in sampled:
+        problem = str(item.get("problem", ""))
+        if len(problem) < 4:  # too short to split meaningfully
+            continue
+        split_idx = len(problem) // 2
+        prefix, gold_continuation = problem[:split_idx], problem[split_idx:]
+        try:
+            resp_ctx = _leakage_call_lm(
+                lm, _open_probe_prompt_with_context(benchmark, prefix)
+            )
+            resp_no = _leakage_call_lm(lm, _open_probe_prompt_no_context(prefix))
+        except Exception:
+            errors += 1
+            continue
+        with_scores.append(_rouge_l_f1(gold_continuation, resp_ctx))
+        no_scores.append(_rouge_l_f1(gold_continuation, resp_no))
+
+    probed = len(with_scores)
+    if probed <= 0:
+        return _leakage_result(
+            0.0,
+            False,
+            f"leakage check could not run: no probeable items "
+            f"({errors} errored) on {benchmark} [n={n}, seed={seed}]",
+        )
+    mean_with = sum(with_scores) / probed
+    mean_no = sum(no_scores) / probed
+    delta = mean_with - mean_no
+    suffix = (
+        f"on {benchmark} [{probed} items, n={n}, seed={seed}"
+        + (f", {errors} errored" if errors else "")
+        + "]"
+    )
+    detail_core = (
+        f"ROUGE-L delta={delta:.3f} {{}} threshold={thr:.3f}, "
+        f"with_ctx={mean_with:.3f} no_ctx={mean_no:.3f}"
+    )
+    if delta > thr:
+        return _leakage_result(
+            0.0, False, f"contamination detected ({detail_core.format('>')}) {suffix}"
+        )
+    return _leakage_result(
+        1.0, True, f"no contamination ({detail_core.format('<=')}) {suffix}"
+    )
+
+
+def _leakage_check_mc(
+    lm, benchmark: str, sampled: list[dict], n: int, threshold: float | None, seed: int
+) -> dict:
+    """Track B: TS-Guessing masked wrong-option reconstruction (exact-match rate)."""
+    thr = _LEAKAGE_DEFAULT_EM_THRESHOLD if threshold is None else threshold
+    matched = 0
+    probed = 0
+    skipped = 0
+    errors = 0
+    for item in sampled:
+        stem, options = _parse_mc_problem(str(item.get("problem", "")))
+        correct_letter = str(item.get("answer", "")).strip().upper()
+        wrong_letters = sorted(x for x in options if x != correct_letter)
+        # Need parseable options, a known correct letter, and a wrong option to mask.
+        if not options or correct_letter not in options or not wrong_letters:
+            skipped += 1
+            continue
+        masked_letter = wrong_letters[0]
+        masked_text = options[masked_letter]
+        prompt = _mc_probe_prompt(
+            benchmark, stem, options, correct_letter, masked_letter
+        )
+        try:
+            response = _leakage_call_lm(lm, prompt)
+        except Exception:
+            errors += 1
+            continue
+        probed += 1
+        if _normalize_option_text(masked_text) and _normalize_option_text(
+            masked_text
+        ) == _normalize_option_text(response):
+            matched += 1
+
+    if probed <= 0:
+        return _leakage_result(
+            0.0,
+            False,
+            f"leakage check could not run: no parseable MC items "
+            f"({skipped} skipped, {errors} errored) on {benchmark} [n={n}, seed={seed}]",
+        )
+    rate = matched / probed
+    suffix = (
+        f"on {benchmark} [{matched}/{probed} items, n={n}, seed={seed}"
+        + (f", {skipped} skipped" if skipped else "")
+        + (f", {errors} errored" if errors else "")
+        + "]"
+    )
+    if rate > thr:
+        return _leakage_result(
+            0.0,
+            False,
+            f"contamination detected (masked-option EM={rate:.3f} > threshold={thr:.3f}) {suffix}",
+        )
+    return _leakage_result(
+        1.0,
+        True,
+        f"no contamination (masked-option EM={rate:.3f} <= threshold={thr:.3f}) {suffix}",
+    )
+
+
+def eval_leakage_check(
+    benchmark: str | None = None,
+    lm=None,
+    n: int = _LEAKAGE_DEFAULT_N,
+    threshold: float | None = None,
+    seed: int = _LEAKAGE_DEFAULT_SEED,
+    items: list[dict] | None = None,
+) -> dict:
+    """Training-data contamination gate (H4) — measures verbatim recall.
+
+    Samples `n` benchmark items with a seeded rng and dispatches on the
+    benchmark type to a memorization probe that is robust to chain-of-thought
+    and does NOT conflate answer correctness with contamination:
+
+      * open-ended (math500, aime-2024): guided-instruction quiz completion with
+        a WITH/WITHOUT dataset-context ROUGE-L baseline delta (Track A).
+      * multiple-choice (gpqa-diamond): TS-Guessing masked wrong-option
+        reconstruction, scored by normalized exact-match rate (Track B).
+
+    Args:
+        benchmark: dataset selector (default "math500"). Also selects the track;
+            still honored when `items` is supplied (so tests can drive a track).
+        lm: language model exposing `agenerate_single`/`generate`. When None,
+            one is constructed from the environment (ITS_ENDPOINT etc.) and
+            closed before returning (no aiohttp session leak).
+        n: number of items to probe (default 10).
+        threshold: contamination cutoff. When None (default) the track-specific
+            default is used — 0.3 ROUGE-L delta for open-ended, 0.5 exact-match
+            rate for multiple-choice. A value strictly ABOVE the threshold means
+            contamination; a value == threshold passes.
+        seed: seed for the reproducible item sample (default 0). The same seed
+            always selects the same items.
+        items: optional pre-loaded [{problem, answer, ...}] list, bypassing
+            dataset loading (used by tests / advanced callers).
+
+    Returns:
+        Standard eval dict. Contaminated -> score=0.0, passed=False,
+        details="contamination detected (...)". Otherwise score=1.0,
+        passed=True. If the check cannot run (no items, no reachable LM,
+        nothing parseable) it degrades to score=0.0, passed=False and NEVER
+        raises.
+    """
+    import random
+
+    benchmark = benchmark or _LEAKAGE_DEFAULT_BENCHMARK
+    track = _leakage_track_for(benchmark)
+
+    # 1. Materialize the item pool (injected > loaded from the benchmark).
+    if items is None:
+        try:
+            items = _leakage_load_items(benchmark)
+        except Exception as e:  # missing `datasets`, bad selector, network, ...
+            return _leakage_result(
+                0.0, False, f"leakage check could not run: dataset load failed ({type(e).__name__})"
+            )
+    if not items:
+        return _leakage_result(
+            0.0, False, f"leakage check could not run: no items for {benchmark!r}"
+        )
+
+    # 2. Reproducible, seeded item selection (deterministic across runs).
+    rng = random.Random(seed)
+    k = min(n, len(items))
+    sampled_idx = sorted(rng.sample(range(len(items)), k=k))
+    sampled = [items[i] for i in sampled_idx]
+
+    # 3. Resolve the LM (env-constructed when not injected).
+    constructed = lm is None
+    if lm is None:
+        lm = _leakage_construct_lm()
+    if lm is None:
+        return _leakage_result(
+            0.0,
+            False,
+            "leakage check could not run: no LM supplied and no endpoint set "
+            "(ITS_ENDPOINT)",
+        )
+
+    # 4. Dispatch to the track-appropriate memorization probe. Always close an
+    #    LM we constructed so no aiohttp client session is leaked.
+    try:
+        if track == "mc":
+            return _leakage_check_mc(lm, benchmark, sampled, n, threshold, seed)
+        return _leakage_check_open(lm, benchmark, sampled, n, threshold, seed)
+    finally:
+        if constructed:
+            _leakage_close_lm(lm)
+
+
+# Every eval dimension, keyed by name. `--dimension <name>` runs exactly one of
+# these and prints its dict (which already carries top-level `score`/`details`)
+# so the factory runner can read the metric directly.
+_DIMENSIONS = {
+    "tests": eval_tests,
+    "lint": eval_lint,
+    "coverage": eval_coverage,
+    "observability": eval_observability,
+    "accuracy": eval_accuracy,
+    "leakage_check": eval_leakage_check,
+}
+
+# The bare-bundle evals (no args) deliberately EXCLUDE `accuracy`: it drives an
+# expensive GPU benchmark and is scored on its own via `--dimension accuracy`,
+# so the default `{"results": [...]}` bundle stays cheap and never triggers a
+# GPU run.
 EVALS = [eval_tests, eval_lint, eval_coverage, eval_observability]
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run Software Factory eval dimensions and emit JSON to stdout.",
+    )
+    parser.add_argument(
+        "--dimension",
+        choices=sorted(_DIMENSIONS),
+        help=(
+            "Run a single eval dimension and print its dict with top-level "
+            "'score'/'details' keys. Omit to print the bare bundle "
+            "(excludes 'accuracy', so no GPU run)."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.dimension:
+        result = _DIMENSIONS[args.dimension]()
+        json.dump(result, sys.stdout, indent=2)
+        print()  # trailing newline
+        return
+
     results = [fn() for fn in EVALS]
     output = {"results": results}
     json.dump(output, sys.stdout, indent=2)

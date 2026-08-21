@@ -1,7 +1,6 @@
 import json
 import logging
 import math
-import random
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -16,26 +15,38 @@ from its_hub.api import (
     ChatMessages,
     GenerationUsage,
 )
+from its_hub.core.algorithms._sc_voting import (
+    _default_projection_func,
+    _resolve_vote_mode,
+    _select_hierarchical_most_common_or_random,
+    _select_most_common_or_random,
+    _tiebreak_by_confidence,
+)
 from its_hub.core.orchestrator import LMOrchestrator
-from its_hub.core.utils import extract_content_from_lm_response
+from its_hub.core.utils import (
+    _canonicalize_vote_key,
+    extract_content_from_lm_response,
+)
+
+# Re-exported for backward compatibility: these voting/selection helpers now
+# live in ``_sc_voting`` but are still imported from this module by
+# ``weighted_self_consistency`` and the test suite.
+__all__ = [
+    "SelfConsistency",
+    "SelfConsistencyResult",
+    "_default_projection_func",
+    "_select_hierarchical_most_common_or_random",
+    "_select_most_common_or_random",
+    "_tiebreak_by_confidence",
+    "create_regex_projection_function",
+    "validate_regex_patterns",
+]
 
 # Default tool-call voting strategy for the self-consistency family. Chosen so
 # that responses containing tool calls vote sensibly out of the box (the primary
 # use case for the IaaS gateway). Pass tool_vote=None to force content-only
 # voting, which raises if every response is a tool call.
 DEFAULT_TOOL_VOTE = "tool_hierarchical"
-
-
-def _default_projection_func(response: str) -> str:
-    """Default projection function that uses exact content matching.
-    This function strips whitespace and returns the content as-is for voting.
-    Responses with identical content (after stripping) will be considered equivalent.
-    Args:
-        response: The response content string to project.
-    Returns:
-        The stripped response content.
-    """
-    return response.strip()
 
 
 @dataclass
@@ -48,88 +59,6 @@ class SelfConsistencyResult(AbstractScalingResult):
     @property
     def the_one(self) -> dict:
         return self.responses[self.selected_index]
-
-
-def _select_most_common_or_random(
-    list_to_select_from: list[str],
-) -> tuple[Counter, int]:
-    # count occurrences of each element
-    counts = Counter(list_to_select_from)
-
-    # find the element with maximum occurrences
-    max_count = max(counts.values())
-
-    # find indices of the most common elements
-    most_common_indices = [
-        i for i, r in enumerate(list_to_select_from) if counts[r] == max_count
-    ]
-
-    # select a random index from the most common ones
-    # note above implementation ensures that if there are multiple
-    #      elements with the same count, a random one is selected
-    selected_index = random.choice(most_common_indices)
-
-    return counts, selected_index
-
-
-def _select_hierarchical_most_common_or_random(
-    list_to_select_from: list[tuple],
-) -> tuple[Counter, int]:
-    if not list_to_select_from:
-        raise ValueError("Cannot select from empty list")
-
-    # If all elements are single-element tuples, fall back to flat behavior
-    if all(len(item) == 1 for item in list_to_select_from):
-        flat_list = [item[0] for item in list_to_select_from]
-        _, selected_index = _select_most_common_or_random(flat_list)
-        # Convert back to tuple format for consistency
-        tuple_counts = Counter(list_to_select_from)
-        return tuple_counts, selected_index
-
-    # Find the maximum hierarchy depth
-    max_depth = max(len(item) for item in list_to_select_from)
-
-    # Start with all indices as candidates
-    candidate_indices = list(range(len(list_to_select_from)))
-
-    # Process each level of the hierarchy
-    for level in range(max_depth):
-        # Get the values at this level for current candidates
-        level_values = []
-        valid_indices = []
-
-        for idx in candidate_indices:
-            item = list_to_select_from[idx]
-            if level < len(item):
-                level_values.append(item[level])
-                valid_indices.append(idx)
-
-        if not level_values:
-            break
-
-        # Count occurrences at this level
-        level_counts = Counter(level_values)
-        max_count = max(level_counts.values())
-
-        # Filter candidates to only those with the most common value at this level
-        new_candidates = []
-        for i, idx in enumerate(valid_indices):
-            if level_counts[level_values[i]] == max_count:
-                new_candidates.append(idx)
-
-        candidate_indices = new_candidates
-
-        # If we have a unique winner, we can stop
-        if len(candidate_indices) == 1:
-            break
-
-    # Randomly select from remaining candidates
-    selected_index = random.choice(candidate_indices)
-
-    # Count all original tuples for the result
-    tuple_counts = Counter(list_to_select_from)
-
-    return tuple_counts, selected_index
 
 
 class SelfConsistency(AbstractScalingAlgorithm):
@@ -207,17 +136,35 @@ class SelfConsistency(AbstractScalingAlgorithm):
 
         usage = GenerationUsage()
 
-        # generate responses
+        # generate responses. logprobs=True is requested so the confidence
+        # tie-break (see _process_responses) has per-token log probabilities to
+        # break ties among equally-voted answer groups. Requesting logprobs is a
+        # returned-metadata flag and does not alter sampling, so the vote outcome
+        # for a clear majority is unaffected.
         responses = await self.orchestrator.agenerate(
             lm,
             chat_messages.to_batch(budget),
             tools=tools,
             tool_choice=tool_choice,
             usage_accumulator=usage,
+            logprobs=True,
         )
 
         # process responses and return result
         return self._process_responses(responses, return_response_only, usage)
+
+    def _is_tool_vote_path(self, responses: list[dict]) -> bool:
+        """Whether voting routes through tool-call signatures (vs content).
+
+        Mirrors the branch decision in ``_project_responses`` so callers can tell
+        which projection space a response list will use without re-projecting.
+        Tool-call signatures are already normalized and must NOT be
+        text-canonicalized for vote grouping.
+        """
+        tool_call_count = sum(1 for r in responses if r.get("tool_calls"))
+        required_majority = math.ceil(len(responses) / 2)
+        has_majority_tool_calls = tool_call_count >= required_majority
+        return bool(has_majority_tool_calls and self.tool_vote)
 
     def _project_responses(self, responses: list[dict]) -> tuple[list[int], list]:
         """Project responses to comparable values for voting.
@@ -228,11 +175,7 @@ class SelfConsistency(AbstractScalingAlgorithm):
             (eligible_indices, projected_values) where eligible_indices maps
             back to positions in the original responses list.
         """
-        tool_call_count = sum(1 for r in responses if r.get("tool_calls"))
-        required_majority = math.ceil(len(responses) / 2)
-        has_majority_tool_calls = tool_call_count >= required_majority
-
-        if has_majority_tool_calls and self.tool_vote:
+        if self._is_tool_vote_path(responses):
             eligible_indices = [
                 i for i, r in enumerate(responses) if r.get("tool_calls")
             ]
@@ -240,17 +183,79 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 self._extract_tool_call_features(responses[i]) for i in eligible_indices
             ]
         else:
-            eligible_indices = [
+            content_indices = [
                 i for i, r in enumerate(responses) if not r.get("tool_calls")
             ]
-            projected = [
+            content_projected = [
                 self.consistency_space_projection_func(
                     extract_content_from_lm_response(responses[i])
                 )
-                for i in eligible_indices
+                for i in content_indices
             ]
+            # Answer-bearing eligibility filter: responses whose projection is
+            # None/empty/whitespace-only carry no answer and must not win the
+            # majority vote (mirrors the tool-call eligibility filter above).
+            # If EVERY projection is empty, fall back to the full content set so
+            # _process_responses still has at least one candidate (never zero).
+            non_empty = [
+                (idx, proj)
+                for idx, proj in zip(content_indices, content_projected)
+                if not self._is_empty_projection(proj)
+            ]
+            if non_empty:
+                eligible_indices = [idx for idx, _ in non_empty]
+                projected = [proj for _, proj in non_empty]
+            else:
+                eligible_indices = content_indices
+                projected = content_projected
 
         return eligible_indices, projected
+
+    @staticmethod
+    def _aggregate_logprob(response: dict) -> float | None:
+        """Mean per-token log probability of a response, or None if unavailable.
+
+        Reads the OpenAI-format ``_logprobs`` metadata attached by the LM client
+        (``choice["logprobs"]`` threaded through to ``response["_logprobs"]``).
+        The MEAN (not sum) is used so responses of different token lengths are
+        compared on an equal footing -- a summed logprob would systematically
+        penalise longer answers regardless of their per-token confidence.
+        Returns None when no logprob data is present so the tie-break can skip
+        this candidate rather than treat missing data as low confidence.
+        """
+        lp = response.get("_logprobs")
+        if not lp:
+            return None
+        content = lp.get("content")
+        if not content:
+            return None
+        values = [
+            tok["logprob"]
+            for tok in content
+            if isinstance(tok, dict) and tok.get("logprob") is not None
+        ]
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    @staticmethod
+    def _is_empty_projection(projected) -> bool:
+        """Whether a content projection carries no answer.
+
+        A projection is empty (ineligible to win a vote) when it is None, an
+        empty/whitespace-only string, or a hierarchical tuple whose every level
+        is itself None or empty/whitespace-only. Any other value is answer-bearing.
+        """
+        if projected is None:
+            return True
+        if isinstance(projected, str):
+            return projected.strip() == ""
+        if isinstance(projected, tuple):
+            return all(
+                level is None or (isinstance(level, str) and level.strip() == "")
+                for level in projected
+            )
+        return False
 
     def _process_responses(
         self,
@@ -270,6 +275,18 @@ class SelfConsistency(AbstractScalingAlgorithm):
 
         eligible_indices, responses_projected = self._project_responses(responses)
 
+        # Formatting-invariant vote keys for COUNTING only: on the content path,
+        # group answers that differ merely in presentation (e.g. \boxed{\text{C}}
+        # vs \boxed{C} vs (C)) into one vote group before counting. On the
+        # tool-call path the raw projections are already canonical signatures and
+        # must not be text-canonicalized, so the keys are the projections as-is.
+        # Selection still returns a real response index and the_one still returns
+        # the full, unmodified selected response for the grader to re-extract.
+        if self._is_tool_vote_path(responses):
+            vote_keys = responses_projected
+        else:
+            vote_keys = [_canonicalize_vote_key(proj) for proj in responses_projected]
+
         # Error if no eligible responses after filtering
         if not eligible_indices:
             raise ValueError(
@@ -278,14 +295,38 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 "This typically happens when tool_vote is not set but all responses contain tool calls."
             )
 
-        # Determine if we're dealing with hierarchical (tuple) or flat projections
+        # Confidence tie-break scores, aligned to the projected/eligible list.
+        # Only consulted when the vote is a tie among >=2 answer groups; a clear
+        # majority ignores these entirely (byte-unchanged clear-winner path).
+        # If no response carries logprobs, pass None so selection stays random.
+        tiebreak_scores = [self._aggregate_logprob(responses[i]) for i in eligible_indices]
+        if all(score is None for score in tiebreak_scores):
+            tiebreak_scores = None
+
+        # Voting rule A/B switch (H5): ITS_SC_VOTE=confidence enables full
+        # confidence-weighted voting; default ``plurality`` keeps the current
+        # path byte-identical. Resolved here at the call site so a single env var
+        # flips both selectors below with no code edits between A/B runs.
+        vote_mode = _resolve_vote_mode()
+
+        # Determine if we're dealing with hierarchical (tuple) or flat projections.
+        # vote_keys carries the canonical grouping key (aligned to the projected
+        # list); selection returns a position into the eligible list either way.
         if responses_projected and isinstance(responses_projected[0], tuple):
             response_counts, filtered_selected_index = (
-                _select_hierarchical_most_common_or_random(responses_projected)
+                _select_hierarchical_most_common_or_random(
+                    responses_projected,
+                    tiebreak_scores,
+                    vote_keys=vote_keys,
+                    vote_mode=vote_mode,
+                )
             )
         else:
             response_counts, filtered_selected_index = _select_most_common_or_random(
-                responses_projected
+                responses_projected,
+                tiebreak_scores,
+                vote_keys=vote_keys,
+                vote_mode=vote_mode,
             )
 
         # Map back to original index
