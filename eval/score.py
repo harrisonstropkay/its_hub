@@ -229,6 +229,123 @@ _ACCURACY_BENCHMARKS = [
     ("gpqa-diamond", ":20"),
 ]
 
+# --- H3: multi-run confidence intervals + hardware/version stamping ----------
+#
+# eval_accuracy honors ITS_EVAL_RUNS=N (default 1) to run each scored TEST slice
+# N times with DETERMINISTICALLY-DERIVED per-run seeds (master + run_index,
+# threaded to the benchmark subprocess LM via the H2 ITS_SEED channel), then
+# reports per-dimension mean AND sample stddev. When a dimension's stddev
+# exceeds the sampling noise floor it is FLAGGED in `details` only — this is
+# purely informational and NEVER changes the score, weight, or pass/fail gate.
+# The composite score is computed from the per-benchmark MEANS, so at the
+# default ITS_EVAL_RUNS=1 the mean over one run == that run and the score/weight/
+# passed are byte-identical to the pre-H3 single-run behavior.
+_ACCURACY_NOISE_FLOOR = 0.04  # sampling-noise stddev cutoff (report-only flag)
+_ACCURACY_DEFAULT_RUNS = 1
+
+
+def _get_eval_runs() -> int:
+    """Read ITS_EVAL_RUNS (default 1). Invalid / <1 values degrade to 1."""
+    raw = os.environ.get("ITS_EVAL_RUNS")
+    if raw in (None, ""):
+        return _ACCURACY_DEFAULT_RUNS
+    try:
+        n = int(raw)
+    except ValueError:
+        return _ACCURACY_DEFAULT_RUNS
+    return n if n >= 1 else _ACCURACY_DEFAULT_RUNS
+
+
+def _get_master_seed() -> int | None:
+    """Read the master seed from ITS_SEED (H2). None when unset/invalid.
+
+    None means "do not inject a seed" so the single-run default path inherits
+    the environment exactly as today (byte-identical behavior).
+    """
+    raw = os.environ.get("ITS_SEED")
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _derive_run_seeds(master_seed: int, n: int) -> list[int]:
+    """Deterministic per-run seed sequence: master_seed + run_index.
+
+    Pure function — the same (master_seed, n) always yields the same sequence,
+    so a recorded multi-run eval is reproducible. Threaded into each benchmark
+    subprocess via ITS_SEED (H2 seed forwarding to vLLM SamplingParams(seed)).
+    """
+    return [master_seed + i for i in range(n)]
+
+
+def _sample_stddev(values: list[float]) -> float:
+    """Sample standard deviation (ddof=1). 0.0 for fewer than two values.
+
+    Hand-rolled to keep the scoring path free of a scipy/numpy import here; the
+    stddev is report-only and never enters the scored composite.
+    """
+    k = len(values)
+    if k < 2:
+        return 0.0
+    mean = sum(values) / k
+    var = sum((v - mean) ** 2 for v in values) / (k - 1)
+    return var**0.5
+
+
+def _hw_version_metadata() -> dict:
+    """Best-effort hardware/library stamp for the benchmark run (H3).
+
+    Every import/probe is guarded so a missing package or absent GPU degrades to
+    'unknown'/None and NEVER raises. Stamped into the accuracy `details` so each
+    recorded score is self-describing and auditable across hardware/versions.
+    """
+    meta = {
+        "vllm_version": "unknown",
+        "torch_version": "unknown",
+        "cuda_version": None,
+        "gpu_model": None,
+        # The batch-invariant flag pairs with H2 seeding for seed-level
+        # reproducibility; recorded verbatim (None when unset).
+        "vllm_batch_invariant": os.environ.get("VLLM_BATCH_INVARIANT"),
+    }
+    try:
+        import vllm  # type: ignore
+
+        meta["vllm_version"] = getattr(vllm, "__version__", "unknown") or "unknown"
+    except Exception:
+        pass
+    try:
+        import torch  # type: ignore
+
+        meta["torch_version"] = getattr(torch, "__version__", "unknown") or "unknown"
+        meta["cuda_version"] = getattr(getattr(torch, "version", None), "cuda", None)
+        try:
+            if torch.cuda.is_available():
+                meta["gpu_model"] = torch.cuda.get_device_name(0)
+        except Exception:
+            meta["gpu_model"] = None
+    except Exception:
+        pass
+    return meta
+
+
+def _fmt_hw_metadata(meta: dict) -> str:
+    """Compact single-line rendering of _hw_version_metadata() for `details`."""
+
+    def _s(v):
+        return "unknown" if v is None else str(v)
+
+    return (
+        f"hw: vllm={_s(meta.get('vllm_version'))} "
+        f"torch={_s(meta.get('torch_version'))} "
+        f"cuda={_s(meta.get('cuda_version'))} "
+        f"gpu={_s(meta.get('gpu_model'))} "
+        f"batch_invariant={_s(meta.get('vllm_batch_invariant'))}"
+    )
+
 
 def _accuracy_result(score: float, passed: bool, details: str) -> dict:
     return {
@@ -283,6 +400,85 @@ def _accuracy_from_jsonl(path: str, budget: int) -> float | None:
     return sum(scores) / len(scores)
 
 
+def _run_benchmarks_once(
+    *,
+    endpoint: str,
+    model: str,
+    api_key: str,
+    alg: str,
+    budget: int,
+    timeout_s: int,
+    tokens_per_step: str | None,
+    repo_root: str,
+    bench_script: str,
+    seed: int | None,
+) -> tuple[dict[str, float | None], list[str]]:
+    """Run every scored benchmark slice ONCE and return (accuracies, notes).
+
+    This is the pre-H3 single-run sweep, extracted verbatim so the multi-run
+    loop can call it N times. When ``seed`` is not None it is threaded to the
+    benchmark subprocess via the ITS_SEED env var (H2 → SamplingParams(seed=…));
+    when it is None the subprocess is launched EXACTLY as before (inheriting the
+    ambient environment with no ``env=`` override), preserving byte-identical
+    single-run behavior.
+    """
+    import glob
+    import tempfile
+
+    accuracies: dict[str, float | None] = {}
+    notes: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="its-accuracy-") as out_dir:
+        for bench, subset in _ACCURACY_BENCHMARKS:
+            cmd = [
+                sys.executable,
+                bench_script,
+                "--benchmark", bench,
+                "--model_name", model,
+                "--endpoint", endpoint,
+                "--api_key", api_key,
+                "--alg", alg,
+                "--subset", subset,
+                "--budgets", str(budget),
+                "--output_dir", out_dir,
+                "--is_async",
+                "--does_eval",
+                "--force_run",
+            ]
+            if tokens_per_step:
+                cmd += ["--tokens_per_step", tokens_per_step]
+            run_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": timeout_s,
+                "cwd": repo_root,
+            }
+            # Only override the child env when a seed is being injected — leaving
+            # the None path identical to the pre-H3 call keeps the default
+            # single-run behavior byte-identical.
+            if seed is not None:
+                child_env = dict(os.environ)
+                child_env["ITS_SEED"] = str(seed)
+                run_kwargs["env"] = child_env
+            try:
+                subprocess.run(cmd, **run_kwargs)
+            except subprocess.TimeoutExpired:
+                notes.append(f"{bench}: timed out after {timeout_s}s")
+                accuracies[bench] = None
+                continue
+            except Exception as e:  # never let a subprocess failure crash scoring
+                notes.append(f"{bench}: run error ({type(e).__name__})")
+                accuracies[bench] = None
+                continue
+
+            matches = glob.glob(os.path.join(out_dir, f"*{bench}.jsonl"))
+            acc = _accuracy_from_jsonl(matches[0], budget) if matches else None
+            accuracies[bench] = acc
+            if acc is None:
+                notes.append(f"{bench}: no usable rows")
+
+    return accuracies, notes
+
+
 def eval_accuracy() -> dict:
     """Composite math + science accuracy via the benchmark harness.
 
@@ -296,6 +492,17 @@ def eval_accuracy() -> dict:
       ITS_BUDGET                      per-experiment budget, must be in {4, 8} (default 4)
       ITS_EVAL_TIMEOUT                hard per-benchmark wall-clock cap (default 1200s)
       ITS_TOKENS_PER_STEP             optional fixed tokens-per-step for step algorithms
+      ITS_EVAL_RUNS                   number of scored repetitions (H3, default 1)
+      ITS_SEED                        master seed; per-run seeds = master + run_index
+
+    Multi-run confidence intervals (H3): with ITS_EVAL_RUNS=N>1 each scored
+    slice is run N times with deterministically-derived per-run seeds; the
+    per-dimension mean AND sample stddev are reported, and a stddev above the
+    ``_ACCURACY_NOISE_FLOOR`` is FLAGGED in details ("signal vs sampling"). The
+    flag is report-only — the composite score is computed from the per-benchmark
+    MEANS and the weights/slices/gate are untouched, so the default N=1 path is
+    behavior-identical to the pre-H3 single run. The run is also stamped with
+    hardware/library versions for auditability.
 
     Graceful degradation: if no endpoint is set/reachable, returns score=0.0,
     passed=False with clear details and NEVER raises. A TimeoutExpired on any
@@ -332,9 +539,6 @@ def eval_accuracy() -> dict:
             f"endpoint set ({endpoint}) but unreachable — is vLLM serving?",
         )
 
-    import glob
-    import tempfile
-
     model = os.environ.get("ITS_MODEL", "Qwen/Qwen2.5-Math-7B-Instruct")
     api_key = (
         os.environ.get("ITS_API_KEY")
@@ -347,80 +551,98 @@ def eval_accuracy() -> dict:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     bench_script = os.path.join(repo_root, "benchmarking", "benchmark.py")
 
-    accuracies: dict[str, float | None] = {}
-    notes = []
-    with tempfile.TemporaryDirectory(prefix="its-accuracy-") as out_dir:
-        for bench, subset in _ACCURACY_BENCHMARKS:
-            cmd = [
-                sys.executable,
-                bench_script,
-                "--benchmark", bench,
-                "--model_name", model,
-                "--endpoint", endpoint,
-                "--api_key", api_key,
-                "--alg", alg,
-                "--subset", subset,
-                "--budgets", str(budget),
-                "--output_dir", out_dir,
-                "--is_async",
-                "--does_eval",
-                "--force_run",
-            ]
-            if tokens_per_step:
-                cmd += ["--tokens_per_step", tokens_per_step]
-            try:
-                subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                    cwd=repo_root,
-                )
-            except subprocess.TimeoutExpired:
-                notes.append(f"{bench}: timed out after {timeout_s}s")
-                accuracies[bench] = None
-                continue
-            except Exception as e:  # never let a subprocess failure crash scoring
-                notes.append(f"{bench}: run error ({type(e).__name__})")
-                accuracies[bench] = None
-                continue
+    # H3 run count + deterministic per-run seed sequence. At the default N=1 with
+    # no explicit ITS_SEED, `seeds = [None]` so the single subprocess sweep is
+    # launched exactly as pre-H3 (env inherited, no injection) — byte-identical.
+    n_runs = _get_eval_runs()
+    master_seed = _get_master_seed()
+    if n_runs == 1 and master_seed is None:
+        seeds: list[int | None] = [None]
+    else:
+        base = master_seed if master_seed is not None else 0
+        seeds = list(_derive_run_seeds(base, n_runs))
 
-            matches = glob.glob(os.path.join(out_dir, f"*{bench}.jsonl"))
-            acc = _accuracy_from_jsonl(matches[0], budget) if matches else None
-            accuracies[bench] = acc
-            if acc is None:
-                notes.append(f"{bench}: no usable rows")
+    per_run: list[dict[str, float | None]] = []
+    notes: list[str] = []
+    for run_idx, seed in enumerate(seeds):
+        accs, run_notes = _run_benchmarks_once(
+            endpoint=endpoint,
+            model=model,
+            api_key=api_key,
+            alg=alg,
+            budget=budget,
+            timeout_s=timeout_s,
+            tokens_per_step=tokens_per_step,
+            repo_root=repo_root,
+            bench_script=bench_script,
+            seed=seed,
+        )
+        per_run.append(accs)
+        prefix = f"run{run_idx}: " if len(seeds) > 1 else ""
+        notes.extend(prefix + n for n in run_notes)
+
+    # Aggregate to per-benchmark mean + sample stddev across the usable runs.
+    means: dict[str, float | None] = {}
+    stddevs: dict[str, float] = {}
+    for bench, _ in _ACCURACY_BENCHMARKS:
+        vals = [r[bench] for r in per_run if r.get(bench) is not None]
+        means[bench] = (sum(vals) / len(vals)) if vals else None
+        stddevs[bench] = _sample_stddev(vals)
 
     math_parts = [
-        accuracies[b] for b in ("math500", "aime-2024") if accuracies.get(b) is not None
+        means[b] for b in ("math500", "aime-2024") if means.get(b) is not None
     ]
     math_acc = sum(math_parts) / len(math_parts) if math_parts else None
-    gpqa_acc = accuracies.get("gpqa-diamond")
+    gpqa_acc = means.get("gpqa-diamond")
+
+    hw_meta = _hw_version_metadata()
 
     # No usable results at all → treat as an unreachable/degraded run.
     if math_acc is None and gpqa_acc is None:
         detail = "endpoint set but no usable results"
         if notes:
             detail += " — " + "; ".join(notes)
+        detail += " | " + _fmt_hw_metadata(hw_meta)
         return _accuracy_result(0.0, False, detail)
 
+    # Composite is computed from the per-benchmark MEANS. At N=1 mean == the
+    # single run, so this reproduces the pre-H3 score/weight/gate exactly.
     score = 0.5 * (math_acc or 0.0) + 0.5 * (gpqa_acc or 0.0)
     score = max(0.0, min(1.0, score))
-    complete = all(accuracies.get(b) is not None for b, _ in _ACCURACY_BENCHMARKS)
+    complete = all(means.get(b) is not None for b, _ in _ACCURACY_BENCHMARKS)
 
     def _fmt(v):
         return f"{v:.3f}" if v is not None else "n/a"
 
     details = (
         f"budget={budget} alg={alg} | "
-        f"math500={_fmt(accuracies.get('math500'))} "
-        f"aime={_fmt(accuracies.get('aime-2024'))} "
+        f"math500={_fmt(means.get('math500'))} "
+        f"aime={_fmt(means.get('aime-2024'))} "
         f"gpqa={_fmt(gpqa_acc)} | "
         f"math_acc={_fmt(math_acc)} science_acc={_fmt(gpqa_acc)} "
         f"-> score={score:.4f}"
     )
+
+    # H3 multi-run reporting: per-dimension stddev + noise-floor flag. This is
+    # informational ONLY and does not touch score/weight/passed above.
+    if len(seeds) > 1:
+        sd_bits = [
+            f"{b}={stddevs[b]:.3f}" for b, _ in _ACCURACY_BENCHMARKS if means.get(b) is not None
+        ]
+        details += f" | runs={len(seeds)} stddev[{' '.join(sd_bits)}]"
+        flags = [
+            f"signal vs sampling: {b} stddev={stddevs[b]:.3f} > "
+            f"{_ACCURACY_NOISE_FLOOR:.2f} noise floor"
+            for b, _ in _ACCURACY_BENCHMARKS
+            if means.get(b) is not None and stddevs[b] > _ACCURACY_NOISE_FLOOR
+        ]
+        if flags:
+            details += " | " + "; ".join(flags)
+
     if notes:
         details += " | " + "; ".join(notes)
+
+    details += " | " + _fmt_hw_metadata(hw_meta)
 
     return _accuracy_result(score, complete and score > 0.0, details)
 
