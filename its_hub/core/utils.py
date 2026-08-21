@@ -5,20 +5,10 @@ import warnings
 SAL_STEP_BY_STEP_SYSTEM_PROMPT = "Solve the following math problem efficiently and clearly:\n\n- For simple problems (2 steps or fewer):\nProvide a concise solution with minimal explanation.\n\n- For complex problems (3 steps or more):\nUse this step-by-step format:\n\n## Step 1: [Concise description]\n[Brief explanation and calculations]\n\n## Step 2: [Concise description]\n[Brief explanation and calculations]\n\n...\n\nRegardless of the approach, always conclude with:\n\nTherefore, the final answer is: $\\boxed{answer}$. I hope it is correct.\n\nWhere [answer] is just the final number or expression that solves the problem."
 
 QWEN_SYSTEM_PROMPT = (
-    "Solve the problem by reasoning step by step. Follow these rules exactly:\n"
-    "1. Keep your reasoning concise. Show only the steps needed to reach the "
-    "answer, and do not restate the problem, explore dead ends, or pad the "
-    "explanation. Your entire response must fit within a short context window, "
-    "so budget your tokens and reach the final answer well before running out "
-    "of space.\n"
-    "2. End your response with the final answer inside \\boxed{}, for example "
-    "\\boxed{42}. Always emit exactly one \\boxed{} and make it the last thing "
-    "you write.\n"
-    "3. Stop immediately after the boxed answer. Do not add any text, "
-    "explanation, verification, or restatement after the \\boxed{}.\n"
-    "4. If the question is multiple choice, put ONLY the single choice letter "
-    "(A, B, C, or D) inside the box, for example \\boxed{C} — never the option "
-    "text or any other character."
+    "Please reason step by step, and put your final answer within \\boxed{}. "
+    "Emit exactly one \\boxed{} as the last thing you write, and stop right "
+    "after it. For a multiple-choice question, put only the single choice "
+    "letter (A, B, C, or D) inside the box."
 )
 
 
