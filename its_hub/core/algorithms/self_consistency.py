@@ -50,8 +50,35 @@ class SelfConsistencyResult(AbstractScalingResult):
         return self.responses[self.selected_index]
 
 
+def _tiebreak_by_confidence(
+    candidate_indices: list[int],
+    tiebreak_scores: list[float | None],
+) -> int:
+    """Pick the candidate with the highest aggregate token log probability.
+
+    Used only when the majority vote is a genuine tie among >=2 distinct answer
+    groups. ``candidate_indices`` are positions into the projected/eligible list
+    and ``tiebreak_scores`` is aligned to that same list (see
+    ``SelfConsistency._process_responses``). Higher aggregate logprob = more
+    confident. Ties in score are broken deterministically toward the lowest
+    index so the result never depends on ``random``. Candidates lacking a score
+    (None) are ignored; if none of the tied candidates carry a score, we fall
+    back to a random pick to preserve the never-zero-candidate guarantee.
+    """
+    scored = [
+        (tiebreak_scores[i], i)
+        for i in candidate_indices
+        if i < len(tiebreak_scores) and tiebreak_scores[i] is not None
+    ]
+    if not scored:
+        return random.choice(candidate_indices)
+    best_score = max(score for score, _ in scored)
+    return min(i for score, i in scored if score == best_score)
+
+
 def _select_most_common_or_random(
     list_to_select_from: list[str],
+    tiebreak_scores: list[float | None] | None = None,
 ) -> tuple[Counter, int]:
     # count occurrences of each element
     counts = Counter(list_to_select_from)
@@ -64,16 +91,25 @@ def _select_most_common_or_random(
         i for i, r in enumerate(list_to_select_from) if counts[r] == max_count
     ]
 
-    # select a random index from the most common ones
-    # note above implementation ensures that if there are multiple
-    #      elements with the same count, a random one is selected
-    selected_index = random.choice(most_common_indices)
+    # A "tie" is >=2 DISTINCT answer groups sharing the top count. When a single
+    # group holds the top count (clear majority) behavior is byte-unchanged: a
+    # random member of that group is returned exactly as before. Only on a true
+    # tie among groups do we defer to the confidence tie-break, when available.
+    top_group_count = sum(1 for c in counts.values() if c == max_count)
+    if top_group_count >= 2 and tiebreak_scores is not None:
+        selected_index = _tiebreak_by_confidence(most_common_indices, tiebreak_scores)
+    else:
+        # select a random index from the most common ones
+        # note above implementation ensures that if there are multiple
+        #      elements with the same count, a random one is selected
+        selected_index = random.choice(most_common_indices)
 
     return counts, selected_index
 
 
 def _select_hierarchical_most_common_or_random(
     list_to_select_from: list[tuple],
+    tiebreak_scores: list[float | None] | None = None,
 ) -> tuple[Counter, int]:
     if not list_to_select_from:
         raise ValueError("Cannot select from empty list")
@@ -81,7 +117,7 @@ def _select_hierarchical_most_common_or_random(
     # If all elements are single-element tuples, fall back to flat behavior
     if all(len(item) == 1 for item in list_to_select_from):
         flat_list = [item[0] for item in list_to_select_from]
-        _, selected_index = _select_most_common_or_random(flat_list)
+        _, selected_index = _select_most_common_or_random(flat_list, tiebreak_scores)
         # Convert back to tuple format for consistency
         tuple_counts = Counter(list_to_select_from)
         return tuple_counts, selected_index
@@ -123,8 +159,16 @@ def _select_hierarchical_most_common_or_random(
         if len(candidate_indices) == 1:
             break
 
-    # Randomly select from remaining candidates
-    selected_index = random.choice(candidate_indices)
+    # Select from the remaining candidates. If they map to >=2 distinct answer
+    # tuples this is a genuine tie among groups -> defer to the confidence
+    # tie-break when scores are available. If they are all the same tuple (a
+    # clear winner with multiple identical members) behavior is byte-unchanged:
+    # a random member is returned exactly as before.
+    distinct_survivors = {list_to_select_from[idx] for idx in candidate_indices}
+    if len(distinct_survivors) >= 2 and tiebreak_scores is not None:
+        selected_index = _tiebreak_by_confidence(candidate_indices, tiebreak_scores)
+    else:
+        selected_index = random.choice(candidate_indices)
 
     # Count all original tuples for the result
     tuple_counts = Counter(list_to_select_from)
@@ -207,13 +251,18 @@ class SelfConsistency(AbstractScalingAlgorithm):
 
         usage = GenerationUsage()
 
-        # generate responses
+        # generate responses. logprobs=True is requested so the confidence
+        # tie-break (see _process_responses) has per-token log probabilities to
+        # break ties among equally-voted answer groups. Requesting logprobs is a
+        # returned-metadata flag and does not alter sampling, so the vote outcome
+        # for a clear majority is unaffected.
         responses = await self.orchestrator.agenerate(
             lm,
             chat_messages.to_batch(budget),
             tools=tools,
             tool_choice=tool_choice,
             usage_accumulator=usage,
+            logprobs=True,
         )
 
         # process responses and return result
@@ -269,6 +318,33 @@ class SelfConsistency(AbstractScalingAlgorithm):
         return eligible_indices, projected
 
     @staticmethod
+    def _aggregate_logprob(response: dict) -> float | None:
+        """Mean per-token log probability of a response, or None if unavailable.
+
+        Reads the OpenAI-format ``_logprobs`` metadata attached by the LM client
+        (``choice["logprobs"]`` threaded through to ``response["_logprobs"]``).
+        The MEAN (not sum) is used so responses of different token lengths are
+        compared on an equal footing -- a summed logprob would systematically
+        penalise longer answers regardless of their per-token confidence.
+        Returns None when no logprob data is present so the tie-break can skip
+        this candidate rather than treat missing data as low confidence.
+        """
+        lp = response.get("_logprobs")
+        if not lp:
+            return None
+        content = lp.get("content")
+        if not content:
+            return None
+        values = [
+            tok["logprob"]
+            for tok in content
+            if isinstance(tok, dict) and tok.get("logprob") is not None
+        ]
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    @staticmethod
     def _is_empty_projection(projected) -> bool:
         """Whether a content projection carries no answer.
 
@@ -313,14 +389,24 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 "This typically happens when tool_vote is not set but all responses contain tool calls."
             )
 
+        # Confidence tie-break scores, aligned to the projected/eligible list.
+        # Only consulted when the vote is a tie among >=2 answer groups; a clear
+        # majority ignores these entirely (byte-unchanged clear-winner path).
+        # If no response carries logprobs, pass None so selection stays random.
+        tiebreak_scores = [self._aggregate_logprob(responses[i]) for i in eligible_indices]
+        if all(score is None for score in tiebreak_scores):
+            tiebreak_scores = None
+
         # Determine if we're dealing with hierarchical (tuple) or flat projections
         if responses_projected and isinstance(responses_projected[0], tuple):
             response_counts, filtered_selected_index = (
-                _select_hierarchical_most_common_or_random(responses_projected)
+                _select_hierarchical_most_common_or_random(
+                    responses_projected, tiebreak_scores
+                )
             )
         else:
             response_counts, filtered_selected_index = _select_most_common_or_random(
-                responses_projected
+                responses_projected, tiebreak_scores
             )
 
         # Map back to original index
