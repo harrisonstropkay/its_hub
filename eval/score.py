@@ -425,6 +425,261 @@ def eval_accuracy() -> dict:
     return _accuracy_result(score, complete and score > 0.0, details)
 
 
+# --- Integrity gate: eval_leakage_check() (H4, exp_id=9) --------------------
+#
+# A quantitative training-data-contamination gate. It samples a handful of
+# benchmark items with a SEEDED rng (reproducible: same seed -> same items),
+# probes the model to *recite* each item's gold answer from memory with NO
+# chain-of-thought, and computes the exact-match rate. A model that has
+# memorized the test set can recite gold answers without solving; a clean model
+# cannot. Rate above the threshold => the gate fails (contamination detected).
+#
+# This dimension is PURELY ADDITIVE:
+#   * It is NOT in `EVALS` (the scored bundle) and carries weight 0.0, so it can
+#     never perturb the composite score or the accuracy slices.
+#   * It never imports gold answers into `its_hub/core` — it lives in `eval/`
+#     and reads the dataset only through `benchmarking/benchmark.py`, the same
+#     fixed surface the accuracy path drives at the subprocess boundary.
+
+_LEAKAGE_WEIGHT = 0.0  # informational only — deliberately outside the composite
+_LEAKAGE_DEFAULT_N = 5
+_LEAKAGE_DEFAULT_THRESHOLD = 0.5
+_LEAKAGE_DEFAULT_SEED = 0
+_LEAKAGE_DEFAULT_BENCHMARK = "math500"
+
+
+def _leakage_result(score: float, passed: bool, details: str) -> dict:
+    """Standard eval-dict for the leakage gate (mirrors _accuracy_result)."""
+    return {
+        "name": "leakage_check",
+        "score": round(float(score), 4),
+        "weight": _LEAKAGE_WEIGHT,
+        "passed": bool(passed),
+        "details": details,
+    }
+
+
+def _leakage_normalize(text: str) -> str:
+    """Lower-case and collapse whitespace for a forgiving exact-match compare."""
+    import re
+
+    return re.sub(r"\s+", " ", str(text)).strip().lower()
+
+
+def _leakage_exact_match(gold: str, response: str) -> bool:
+    """True when the model's reproduction contains the exact gold answer.
+
+    The gold answer is normalized (case/whitespace) and matched as an exact
+    substring of the (normalized) response. This surfaces verbatim recitation of
+    the answer key while tolerating incidental surrounding tokens; an empty gold
+    never matches.
+    """
+    g = _leakage_normalize(gold)
+    if not g:
+        return False
+    return g in _leakage_normalize(response)
+
+
+def _leakage_load_items(benchmark: str) -> list[dict]:
+    """Load {problem, answer, unique_id} items for a benchmark.
+
+    Loads `benchmarking/benchmark.py` by path (it is not an importable package)
+    so this stays outside `its_hub/core`. Raises on any failure; callers degrade
+    gracefully.
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bench_path = os.path.join(repo_root, "benchmarking", "benchmark.py")
+    spec = importlib.util.spec_from_file_location("its_leakage_benchmark", bench_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    ds_enum = module.BenchmarkDataset(benchmark)
+    ds = module.load_benchmark_dataset(ds_enum)
+    return [
+        {
+            "problem": str(row["problem"]),
+            "answer": str(row["answer"]),
+            "unique_id": str(row.get("unique_id", "")),
+        }
+        for row in ds
+    ]
+
+
+def _leakage_construct_lm():
+    """Build an LM from env (mirrors eval_accuracy) or return None if unset.
+
+    Uses temperature=0 and forwards the H2 seed (ITS_SEED) for a reproducible
+    recite probe. Never raises — returns None on any construction failure.
+    """
+    endpoint = os.environ.get("ITS_ENDPOINT") or os.environ.get("OPENAI_ENDPOINT")
+    if not endpoint:
+        return None
+    try:
+        from its_hub import OpenAICompatibleLanguageModel
+
+        model = os.environ.get("ITS_MODEL", "Qwen/Qwen2.5-Math-7B-Instruct")
+        api_key = (
+            os.environ.get("ITS_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or "NO_API_KEY"
+        )
+        seed_env = os.environ.get("ITS_SEED")
+        seed = int(seed_env) if seed_env not in (None, "") else None
+        return OpenAICompatibleLanguageModel(
+            endpoint=endpoint,
+            api_key=api_key,
+            model_name=model,
+            temperature=0.0,
+            max_completion_tokens=256,
+            seed=seed,
+        )
+    except Exception:
+        return None
+
+
+def _leakage_probe_prompt(item: dict) -> str:
+    """A no-CoT 'recite the answer key' probe. Never includes the gold answer."""
+    return (
+        "You are being audited for benchmark contamination. The text below is a "
+        "problem taken verbatim from a public evaluation benchmark. From memory, "
+        "reproduce this item's FINAL ANSWER exactly as it appears in the "
+        "benchmark's official answer key. Output ONLY that final answer, with no "
+        "explanation, no working, and no restatement of the problem. If you do "
+        "not recognize this exact item, output exactly: UNKNOWN.\n\n"
+        f"Problem:\n{item['problem']}"
+    )
+
+
+def _leakage_call_lm(lm, prompt: str) -> str:
+    """Send a single recite probe and return the model's text content.
+
+    Supports both the async `agenerate_single` interface (the real
+    OpenAICompatibleLanguageModel) and a sync `generate` (convenient for mocks).
+    """
+    messages = [{"role": "user", "content": prompt}]
+    if hasattr(lm, "agenerate_single"):
+        import asyncio
+
+        async def _run():
+            return await lm.agenerate_single(messages)
+
+        result = asyncio.run(_run())
+    elif hasattr(lm, "generate"):
+        result = lm.generate(messages)
+    else:
+        raise TypeError("lm must expose `agenerate_single` (async) or `generate`")
+
+    if isinstance(result, dict):
+        return result.get("content") or ""
+    return str(result)
+
+
+def eval_leakage_check(
+    benchmark: str | None = None,
+    lm=None,
+    n: int = _LEAKAGE_DEFAULT_N,
+    threshold: float = _LEAKAGE_DEFAULT_THRESHOLD,
+    seed: int = _LEAKAGE_DEFAULT_SEED,
+    items: list[dict] | None = None,
+) -> dict:
+    """Training-data contamination gate (H4).
+
+    Samples `n` benchmark items with a seeded rng, asks the model to recite each
+    item's gold answer from memory with no chain-of-thought, and measures the
+    exact-match rate against the stored answer key.
+
+    Args:
+        benchmark: dataset selector (default "math500"). Ignored when `items`
+            is supplied.
+        lm: language model exposing `agenerate_single`/`generate`. When None,
+            one is constructed from the environment (ITS_ENDPOINT etc.).
+        n: number of items to probe (default 5).
+        threshold: exact-match rate strictly above which contamination is
+            declared (default 0.5). rate == threshold passes.
+        seed: seed for the reproducible item sample (default 0). The same seed
+            always selects the same items.
+        items: optional pre-loaded [{problem, answer, ...}] list, bypassing
+            dataset loading (used by tests / advanced callers).
+
+    Returns:
+        Standard eval dict. rate > threshold -> score=0.0, passed=False,
+        details="contamination detected (...)". Otherwise score=1.0,
+        passed=True with the measured rate. If the check cannot run (no items,
+        no reachable LM) it degrades to score=0.0, passed=False and NEVER raises.
+    """
+    import random
+
+    benchmark = benchmark or _LEAKAGE_DEFAULT_BENCHMARK
+
+    # 1. Materialize the item pool (injected > loaded from the benchmark).
+    if items is None:
+        try:
+            items = _leakage_load_items(benchmark)
+        except Exception as e:  # missing `datasets`, bad selector, network, ...
+            return _leakage_result(
+                0.0, False, f"leakage check could not run: dataset load failed ({type(e).__name__})"
+            )
+    if not items:
+        return _leakage_result(
+            0.0, False, f"leakage check could not run: no items for {benchmark!r}"
+        )
+
+    # 2. Reproducible, seeded item selection (deterministic across runs).
+    rng = random.Random(seed)
+    k = min(n, len(items))
+    sampled_idx = sorted(rng.sample(range(len(items)), k=k))
+    sampled = [items[i] for i in sampled_idx]
+
+    # 3. Resolve the LM (env-constructed when not injected).
+    if lm is None:
+        lm = _leakage_construct_lm()
+    if lm is None:
+        return _leakage_result(
+            0.0,
+            False,
+            "leakage check could not run: no LM supplied and no endpoint set "
+            "(ITS_ENDPOINT)",
+        )
+
+    # 4. Probe each item and count exact recitations of the gold answer.
+    matched = 0
+    errors = 0
+    for item in sampled:
+        try:
+            response = _leakage_call_lm(lm, _leakage_probe_prompt(item))
+        except Exception:
+            errors += 1
+            continue
+        if _leakage_exact_match(item["answer"], response):
+            matched += 1
+
+    probed = k - errors
+    if probed <= 0:
+        return _leakage_result(
+            0.0, False, f"leakage check could not run: all {k} probes errored"
+        )
+
+    rate = matched / probed
+    suffix = (
+        f"on {benchmark} [{matched}/{probed} items, n={n}, seed={seed}"
+        + (f", {errors} errored" if errors else "")
+        + "]"
+    )
+    if rate > threshold:
+        return _leakage_result(
+            0.0,
+            False,
+            f"contamination detected (rate={rate:.3f} > threshold={threshold:.3f}) {suffix}",
+        )
+    return _leakage_result(
+        1.0,
+        True,
+        f"no contamination (rate={rate:.3f} <= threshold={threshold:.3f}) {suffix}",
+    )
+
+
 # Every eval dimension, keyed by name. `--dimension <name>` runs exactly one of
 # these and prints its dict (which already carries top-level `score`/`details`)
 # so the factory runner can read the metric directly.
@@ -434,6 +689,7 @@ _DIMENSIONS = {
     "coverage": eval_coverage,
     "observability": eval_observability,
     "accuracy": eval_accuracy,
+    "leakage_check": eval_leakage_check,
 }
 
 # The bare-bundle evals (no args) deliberately EXCLUDE `accuracy`: it drives an
