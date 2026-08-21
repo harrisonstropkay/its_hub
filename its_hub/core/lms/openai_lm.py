@@ -95,6 +95,16 @@ def _compute_cache_key(request_data: dict, model_name: str) -> str:
     for param in _CACHE_KEY_PARAMS:
         key_obj[param] = request_data.get(param)
 
+    # Seed (H2) participates in the key ONLY when set. Adding a "seed": null
+    # entry for the unseeded case would perturb the canonical JSON and thus the
+    # digest, invalidating every cache recorded before H2. By omitting the field
+    # entirely when seed is None, an unseeded request hashes byte-identically to
+    # the pre-H2 key (backward-compatible), while a set seed yields a distinct
+    # entry -- seed=42, seed=43, and unseeded are three different cache lines.
+    seed = request_data.get("seed")
+    if seed is not None:
+        key_obj["seed"] = seed
+
     canonical_json = json.dumps(key_obj, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -225,7 +235,29 @@ class OpenAICompatibleLanguageModel(AbstractLanguageModel):
         ssl_context: ssl.SSLContext | None = None,
         # Raw response preservation
         include_raw_choices: bool = False,
+        # Reproducible sampling (H2)
+        seed: int | None = None,
     ):
+        """OpenAI-compatible chat-completion client.
+
+        Args:
+            seed: Optional sampling seed forwarded to the server on every
+                request. On a vLLM backend this maps to
+                ``SamplingParams(seed=...)``. When ``None`` (the default) no
+                ``seed`` key is added to the request payload -- behaviour is
+                byte-identical to a client with no seed support, and the H1
+                verification cache key is unchanged, so caches recorded before
+                seed support remain valid. A set seed also produces a distinct
+                cache entry from unseeded / other-seed draws.
+
+                For seed-level reproducibility of the *generated tokens* (not
+                just record/replay of a captured draw) set the environment
+                variable ``VLLM_BATCH_INVARIANT=1`` on the vLLM server so its
+                kernels are batch-invariant. Even then, seeded reproducibility
+                is best-effort: at ``temperature > 0`` outputs remain sensitive
+                to hardware and library versions. Pair the seed with the H1
+                cache (``ITS_CACHE_MODE``) when byte-exact replay is required.
+        """
         assert max_concurrency == -1 or max_concurrency > 0, (
             "max_concurrency must be -1 (unlimited concurrency) or a positive integer"
         )
@@ -256,6 +288,7 @@ class OpenAICompatibleLanguageModel(AbstractLanguageModel):
             max_completion_tokens, max_tokens
         )
         self.temperature = temperature
+        self.seed = seed
 
         # SSL configuration
         self.verify_ssl = verify_ssl
@@ -414,6 +447,12 @@ class OpenAICompatibleLanguageModel(AbstractLanguageModel):
             request_data["max_completion_tokens"] = max_completion_tokens
         if temperature is not None:
             request_data["temperature"] = temperature
+
+        # seed for reproducible sampling (H2). Only emitted when set, so an
+        # unseeded client sends a byte-identical payload to the pre-seed
+        # behaviour. On vLLM this maps to SamplingParams(seed=...).
+        if self.seed is not None:
+            request_data["seed"] = self.seed
 
         # add tools and tool_choice if provided
         if tools is not None:
