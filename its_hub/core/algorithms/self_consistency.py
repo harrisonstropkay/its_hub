@@ -17,7 +17,10 @@ from its_hub.api import (
     GenerationUsage,
 )
 from its_hub.core.orchestrator import LMOrchestrator
-from its_hub.core.utils import extract_content_from_lm_response
+from its_hub.core.utils import (
+    _extract_answer_cascading,
+    extract_content_from_lm_response,
+)
 
 # Default tool-call voting strategy for the self-consistency family. Chosen so
 # that responses containing tool calls vote sensibly out of the box (the primary
@@ -243,17 +246,17 @@ class SelfConsistency(AbstractScalingAlgorithm):
             content_indices = [
                 i for i, r in enumerate(responses) if not r.get("tool_calls")
             ]
-            content_projected = [
-                self.consistency_space_projection_func(
-                    extract_content_from_lm_response(responses[i])
-                )
+            content_contents = [
+                extract_content_from_lm_response(responses[i])
                 for i in content_indices
+            ]
+            content_projected = [
+                self.consistency_space_projection_func(content)
+                for content in content_contents
             ]
             # Answer-bearing eligibility filter: responses whose projection is
             # None/empty/whitespace-only carry no answer and must not win the
             # majority vote (mirrors the tool-call eligibility filter above).
-            # If EVERY projection is empty, fall back to the full content set so
-            # _process_responses still has at least one candidate (never zero).
             non_empty = [
                 (idx, proj)
                 for idx, proj in zip(content_indices, content_projected)
@@ -263,8 +266,33 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 eligible_indices = [idx for idx, _ in non_empty]
                 projected = [proj for _, proj in non_empty]
             else:
-                eligible_indices = content_indices
-                projected = content_projected
+                # All-empty regime: the PRIMARY projection recovered no answer
+                # from ANY response (e.g. every generation truncated before its
+                # \boxed{}). Re-project each response's content through a generic,
+                # content-agnostic cascade so a majority vote can be taken over
+                # the RECOVERED answers instead of degrading to random.choice
+                # over identical empties. This branch is entered ONLY when the
+                # primary projection is empty for all responses, so the
+                # non-empty-projection path above stays byte-for-byte unchanged.
+                recovered = [
+                    _extract_answer_cascading(content)
+                    for content in content_contents
+                ]
+                recovered_non_empty = [
+                    (idx, rec)
+                    for idx, rec in zip(content_indices, recovered)
+                    if rec.strip() != ""
+                ]
+                if recovered_non_empty:
+                    eligible_indices = [idx for idx, _ in recovered_non_empty]
+                    projected = [rec for _, rec in recovered_non_empty]
+                else:
+                    # Recovery still yielded nothing for every response (all
+                    # content empty/whitespace). Fall back to the CURRENT
+                    # behavior — vote over the full content set -> random —
+                    # preserving the never-zero-candidate guarantee.
+                    eligible_indices = content_indices
+                    projected = content_projected
 
         return eligible_indices, projected
 
