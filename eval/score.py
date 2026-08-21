@@ -427,12 +427,29 @@ def eval_accuracy() -> dict:
 
 # --- Integrity gate: eval_leakage_check() (H4, exp_id=9) --------------------
 #
-# A quantitative training-data-contamination gate. It samples a handful of
-# benchmark items with a SEEDED rng (reproducible: same seed -> same items),
-# probes the model to *recite* each item's gold answer from memory with NO
-# chain-of-thought, and computes the exact-match rate. A model that has
-# memorized the test set can recite gold answers without solving; a clean model
-# cannot. Rate above the threshold => the gate fails (contamination detected).
+# A quantitative training-data-contamination gate that measures VERBATIM RECALL
+# of benchmark text (memorization), not answer correctness (capability). It
+# samples a handful of items with a SEEDED rng (reproducible: same seed -> same
+# items) and DISPATCHES on the benchmark type:
+#
+#   TRACK A — open-ended (math500, aime-2024): GUIDED-INSTRUCTION QUIZ COMPLETION
+#     (Golchin & Surdeanu, arXiv:2308.08493). Split each problem at its ~50%
+#     char boundary; ask the model to reproduce the exact continuation of the
+#     prefix (a) WITH dataset-name context and (b) WITHOUT it. Score verbatim
+#     overlap with a self-contained LCS-based ROUGE-L F1. Contamination is a
+#     baseline delta: mean(rougeL_with) - mean(rougeL_without) > delta_threshold.
+#     The baseline cancels out mere fluency, so the signal reflects memorization.
+#
+#   TRACK B — multiple-choice (gpqa-diamond): TS-GUESSING MASKED WRONG-OPTION
+#     RECONSTRUCTION (arXiv:2311.09783). The gold letter (A/B/C/D) appears in
+#     essentially any English text, so it is USELESS as a signal. Instead we mask
+#     a WRONG option's *text* (never shown in the prompt) and ask the model to
+#     reproduce it verbatim; a clean model cannot guess it, a contaminated one
+#     recites it. Contamination is a normalized exact-match rate > threshold.
+#
+# Matching is EXACT-EQUALITY / boundary-aware only — never `gold in response`
+# substring containment, which inverted the old gate on short/single-letter
+# golds (a clean model scored rate=1.000 on GPQA). See adversarial-qa.md.
 #
 # This dimension is PURELY ADDITIVE:
 #   * It is NOT in `EVALS` (the scored bundle) and carries weight 0.0, so it can
@@ -442,10 +459,20 @@ def eval_accuracy() -> dict:
 #     fixed surface the accuracy path drives at the subprocess boundary.
 
 _LEAKAGE_WEIGHT = 0.0  # informational only — deliberately outside the composite
-_LEAKAGE_DEFAULT_N = 5
-_LEAKAGE_DEFAULT_THRESHOLD = 0.5
+_LEAKAGE_DEFAULT_N = 10
+_LEAKAGE_DEFAULT_DELTA_THRESHOLD = 0.3  # Track A: ROUGE-L baseline-delta cutoff
+_LEAKAGE_DEFAULT_EM_THRESHOLD = 0.5  # Track B: masked-option exact-match rate cutoff
 _LEAKAGE_DEFAULT_SEED = 0
 _LEAKAGE_DEFAULT_BENCHMARK = "math500"
+
+# Benchmarks whose items are multiple-choice (Track B). Everything else is
+# treated as open-ended (Track A).
+_LEAKAGE_MC_BENCHMARKS = {"gpqa-diamond", "gpqa", "gpqa_diamond"}
+_LEAKAGE_DISPLAY_NAMES = {
+    "math500": "MATH500",
+    "aime-2024": "AIME 2024",
+    "gpqa-diamond": "GPQA-Diamond",
+}
 
 
 def _leakage_result(score: float, passed: bool, details: str) -> dict:
@@ -459,25 +486,154 @@ def _leakage_result(score: float, passed: bool, details: str) -> dict:
     }
 
 
-def _leakage_normalize(text: str) -> str:
-    """Lower-case and collapse whitespace for a forgiving exact-match compare."""
+def _leakage_track_for(benchmark: str) -> str:
+    """Return 'mc' for multiple-choice benchmarks, else 'open'."""
+    return "mc" if str(benchmark).lower() in _LEAKAGE_MC_BENCHMARKS else "open"
+
+
+def _leakage_display_name(benchmark: str) -> str:
+    """Human dataset name used in the WITH-context probe framing."""
+    return _LEAKAGE_DISPLAY_NAMES.get(str(benchmark).lower(), str(benchmark))
+
+
+# --- verbatim-overlap + answer-matching helpers -----------------------------
+#
+# These REPLACE the removed `_leakage_exact_match` substring test. Matching is
+# always exact-equality (after normalization) or word-boundary — never raw
+# substring containment.
+
+
+def _lcs_length(a: list[str], b: list[str]) -> int:
+    """Length of the longest common subsequence of two token lists (O(n*m))."""
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return 0
+    prev_row = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur_row = [0] * (m + 1)
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            if ai == b[j - 1]:
+                cur_row[j] = prev_row[j - 1] + 1
+            elif prev_row[j] >= cur_row[j - 1]:
+                cur_row[j] = prev_row[j]
+            else:
+                cur_row[j] = cur_row[j - 1]
+        prev_row = cur_row
+    return prev_row[m]
+
+
+def _rouge_l_f1(reference: str, candidate: str) -> float:
+    """Self-contained ROUGE-L F1 (LCS-based) over lower-cased whitespace tokens.
+
+    No external dependency (the `rouge_score` package is not vendored). Returns
+    0.0 when either side is empty. This measures verbatim/ordered overlap, which
+    is exactly the recall signal a contaminated completion produces.
+    """
+    ref = str(reference).lower().split()
+    cand = str(candidate).lower().split()
+    if not ref or not cand:
+        return 0.0
+    lcs = _lcs_length(ref, cand)
+    if lcs == 0:
+        return 0.0
+    precision = lcs / len(cand)
+    recall = lcs / len(ref)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _leakage_extract_answer(response: str) -> str:
+    """Extract a final answer: the last ``\\boxed{...}`` or the final non-empty line."""
     import re
 
-    return re.sub(r"\s+", " ", str(text)).strip().lower()
+    if not response:
+        return ""
+    text = str(response)
+    boxed = re.findall(r"\\boxed\{([^{}]+(?:\{[^{}]*\}[^{}]*)*)\}", text)
+    if boxed:
+        return boxed[-1].strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
 
 
-def _leakage_exact_match(gold: str, response: str) -> bool:
-    """True when the model's reproduction contains the exact gold answer.
+def _normalize_math_answer(ans: str) -> str:
+    """Normalize a math answer for exact comparison.
 
-    The gold answer is normalized (case/whitespace) and matched as an exact
-    substring of the (normalized) response. This surfaces verbatim recitation of
-    the answer key while tolerating incidental surrounding tokens; an empty gold
-    never matches.
+    Lower-cases, unwraps ``\\text{}``/``\\boxed{}``, and strips ``$``, commas,
+    and grouping symbols so equivalent renderings compare equal.
     """
-    g = _leakage_normalize(gold)
+    import re
+
+    s = str(ans).lower()
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\boxed\{([^{}]*)\}", r"\1", s)
+    s = s.replace("$", "").replace(",", "")
+    s = re.sub(r"[(){}\[\]]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _normalize_option_text(text: str) -> str:
+    """Normalize an MC option for exact match: lower-case, collapse ws, strip trailing punctuation."""
+    import re
+
+    s = re.sub(r"\s+", " ", str(text)).strip().lower()
+    return s.strip(" \t\n.,;:!?")
+
+
+def _word_boundary_match(gold: str, response: str) -> bool:
+    """True when the normalized gold appears as a whole token in the response.
+
+    Uses word-boundary anchoring (never raw substring), so single-digit golds do
+    NOT match incidentally inside longer numbers or words.
+    """
+    import re
+
+    g = _normalize_math_answer(gold)
     if not g:
         return False
-    return g in _leakage_normalize(response)
+    pattern = rf"(?<!\w){re.escape(g)}(?!\w)"
+    return re.search(pattern, _normalize_math_answer(response)) is not None
+
+
+def _parse_mc_problem(problem: str) -> tuple[str, dict]:
+    """Split a GPQA-style problem into (question_stem, {letter: option_text}).
+
+    The loader (benchmarking/benchmark.py::_normalize_gpqa_row) builds the
+    problem as ``<question>\\n\\nA) ..\\nB) ..\\nC) ..\\nD) ..\\n\\nPlease reason
+    ...``. We parse the ``X)`` option lines out and drop the trailing boxed-answer
+    instruction so the reconstructed prompt can mask an option cleanly. Returns
+    an empty options dict when nothing parseable is found (caller then skips).
+    """
+    import re
+
+    opt_re = re.compile(r"^\s*([A-D])\)\s*(.*)$")
+    stem_lines: list[str] = []
+    options: dict[str, str] = {}
+    current: str | None = None
+    seen_option = False
+    for line in str(problem).splitlines():
+        m = opt_re.match(line)
+        if m:
+            letter = m.group(1).upper()
+            options[letter] = m.group(2).strip()
+            current = letter
+            seen_option = True
+            continue
+        if not seen_option:
+            stem_lines.append(line)
+            continue
+        stripped = line.strip()
+        if not stripped:
+            current = None
+            continue
+        low = stripped.lower()
+        if low.startswith("please reason") or "\\boxed" in stripped or "put the letter" in low:
+            current = None
+            continue
+        if current is not None:  # continuation of a multi-line option
+            options[current] = (options[current] + " " + stripped).strip()
+    return "\n".join(stem_lines).strip(), options
 
 
 def _leakage_load_items(benchmark: str) -> list[dict]:
@@ -511,7 +667,9 @@ def _leakage_construct_lm():
     """Build an LM from env (mirrors eval_accuracy) or return None if unset.
 
     Uses temperature=0 and forwards the H2 seed (ITS_SEED) for a reproducible
-    recite probe. Never raises — returns None on any construction failure.
+    recall probe. Never raises — returns None on any construction failure. The
+    caller (`eval_leakage_check`) is responsible for `close()`-ing an LM built
+    here so no aiohttp client session is leaked.
     """
     endpoint = os.environ.get("ITS_ENDPOINT") or os.environ.get("OPENAI_ENDPOINT")
     if not endpoint:
@@ -539,21 +697,65 @@ def _leakage_construct_lm():
         return None
 
 
-def _leakage_probe_prompt(item: dict) -> str:
-    """A no-CoT 'recite the answer key' probe. Never includes the gold answer."""
+def _open_probe_prompt_with_context(benchmark: str, prefix: str) -> str:
+    """Track A WITH-context probe: name the dataset and ask for the continuation.
+
+    Never includes the held-out continuation — only the prefix is shown.
+    """
+    name = _leakage_display_name(benchmark)
     return (
-        "You are being audited for benchmark contamination. The text below is a "
-        "problem taken verbatim from a public evaluation benchmark. From memory, "
-        "reproduce this item's FINAL ANSWER exactly as it appears in the "
-        "benchmark's official answer key. Output ONLY that final answer, with no "
-        "explanation, no working, and no restatement of the problem. If you do "
-        "not recognize this exact item, output exactly: UNKNOWN.\n\n"
-        f"Problem:\n{item['problem']}"
+        "You are being audited for benchmark contamination. The text below is "
+        f"the first part of a problem from the {name} benchmark's test split. "
+        "From memory, reproduce the EXACT continuation of this problem as it "
+        "appears in the benchmark, word for word. Do NOT solve it and do NOT "
+        "explain — output only the verbatim continuation that follows the "
+        f"given prefix.\n\nPrefix:\n{prefix}\n\nExact continuation:"
+    )
+
+
+def _open_probe_prompt_no_context(prefix: str) -> str:
+    """Track A baseline probe: identical prefix, NO dataset/benchmark framing."""
+    return (
+        "Continue the following text. Output only the continuation, with no "
+        f"explanation.\n\n{prefix}"
+    )
+
+
+def _mc_probe_prompt(
+    benchmark: str,
+    stem: str,
+    options: dict,
+    correct_letter: str,
+    masked_letter: str,
+) -> str:
+    """Track B (TS-Guessing) probe: mask one WRONG option's text and ask for it.
+
+    The masked option's text is NEVER shown (that is the memorization target).
+    The correct letter is stated and the other options are shown verbatim.
+    """
+    name = _leakage_display_name(benchmark)
+    lines = []
+    for letter in sorted(options):
+        if letter == masked_letter:
+            lines.append(f"{letter}) [MASK]")
+        else:
+            lines.append(f"{letter}) {options[letter]}")
+    opts_block = "\n".join(lines)
+    return (
+        "You are being audited for benchmark contamination. Below is a "
+        f"multiple-choice question from the {name} benchmark's test split. The "
+        f"correct answer is option {correct_letter}. One of the other options "
+        "has been replaced with [MASK]. From memory, reproduce the EXACT "
+        f"original text of option {masked_letter} as it appears in the "
+        "benchmark. Output ONLY that option's text — no explanation, no letter "
+        "label, and no restatement of the question.\n\n"
+        f"Question:\n{stem}\n\nOptions:\n{opts_block}\n\n"
+        f"Exact text of option {masked_letter}:"
     )
 
 
 def _leakage_call_lm(lm, prompt: str) -> str:
-    """Send a single recite probe and return the model's text content.
+    """Send a single probe and return the model's text content.
 
     Supports both the async `agenerate_single` interface (the real
     OpenAICompatibleLanguageModel) and a sync `generate` (convenient for mocks).
@@ -576,42 +778,183 @@ def _leakage_call_lm(lm, prompt: str) -> str:
     return str(result)
 
 
+def _leakage_close_lm(lm) -> None:
+    """Best-effort close of an LM we constructed (avoids aiohttp session leaks)."""
+    close = getattr(lm, "close", None)
+    if close is None:
+        return
+    try:
+        import asyncio
+        import inspect
+
+        if inspect.iscoroutinefunction(close):
+            asyncio.run(close())
+        else:
+            close()
+    except Exception:
+        pass
+
+
+def _leakage_check_open(
+    lm, benchmark: str, sampled: list[dict], n: int, threshold: float | None, seed: int
+) -> dict:
+    """Track A: guided-instruction quiz completion with a WITH/WITHOUT baseline."""
+    thr = _LEAKAGE_DEFAULT_DELTA_THRESHOLD if threshold is None else threshold
+    with_scores: list[float] = []
+    no_scores: list[float] = []
+    errors = 0
+    for item in sampled:
+        problem = str(item.get("problem", ""))
+        if len(problem) < 4:  # too short to split meaningfully
+            continue
+        split_idx = len(problem) // 2
+        prefix, gold_continuation = problem[:split_idx], problem[split_idx:]
+        try:
+            resp_ctx = _leakage_call_lm(
+                lm, _open_probe_prompt_with_context(benchmark, prefix)
+            )
+            resp_no = _leakage_call_lm(lm, _open_probe_prompt_no_context(prefix))
+        except Exception:
+            errors += 1
+            continue
+        with_scores.append(_rouge_l_f1(gold_continuation, resp_ctx))
+        no_scores.append(_rouge_l_f1(gold_continuation, resp_no))
+
+    probed = len(with_scores)
+    if probed <= 0:
+        return _leakage_result(
+            0.0,
+            False,
+            f"leakage check could not run: no probeable items "
+            f"({errors} errored) on {benchmark} [n={n}, seed={seed}]",
+        )
+    mean_with = sum(with_scores) / probed
+    mean_no = sum(no_scores) / probed
+    delta = mean_with - mean_no
+    suffix = (
+        f"on {benchmark} [{probed} items, n={n}, seed={seed}"
+        + (f", {errors} errored" if errors else "")
+        + "]"
+    )
+    detail_core = (
+        f"ROUGE-L delta={delta:.3f} {{}} threshold={thr:.3f}, "
+        f"with_ctx={mean_with:.3f} no_ctx={mean_no:.3f}"
+    )
+    if delta > thr:
+        return _leakage_result(
+            0.0, False, f"contamination detected ({detail_core.format('>')}) {suffix}"
+        )
+    return _leakage_result(
+        1.0, True, f"no contamination ({detail_core.format('<=')}) {suffix}"
+    )
+
+
+def _leakage_check_mc(
+    lm, benchmark: str, sampled: list[dict], n: int, threshold: float | None, seed: int
+) -> dict:
+    """Track B: TS-Guessing masked wrong-option reconstruction (exact-match rate)."""
+    thr = _LEAKAGE_DEFAULT_EM_THRESHOLD if threshold is None else threshold
+    matched = 0
+    probed = 0
+    skipped = 0
+    errors = 0
+    for item in sampled:
+        stem, options = _parse_mc_problem(str(item.get("problem", "")))
+        correct_letter = str(item.get("answer", "")).strip().upper()
+        wrong_letters = sorted(x for x in options if x != correct_letter)
+        # Need parseable options, a known correct letter, and a wrong option to mask.
+        if not options or correct_letter not in options or not wrong_letters:
+            skipped += 1
+            continue
+        masked_letter = wrong_letters[0]
+        masked_text = options[masked_letter]
+        prompt = _mc_probe_prompt(
+            benchmark, stem, options, correct_letter, masked_letter
+        )
+        try:
+            response = _leakage_call_lm(lm, prompt)
+        except Exception:
+            errors += 1
+            continue
+        probed += 1
+        if _normalize_option_text(masked_text) and _normalize_option_text(
+            masked_text
+        ) == _normalize_option_text(response):
+            matched += 1
+
+    if probed <= 0:
+        return _leakage_result(
+            0.0,
+            False,
+            f"leakage check could not run: no parseable MC items "
+            f"({skipped} skipped, {errors} errored) on {benchmark} [n={n}, seed={seed}]",
+        )
+    rate = matched / probed
+    suffix = (
+        f"on {benchmark} [{matched}/{probed} items, n={n}, seed={seed}"
+        + (f", {skipped} skipped" if skipped else "")
+        + (f", {errors} errored" if errors else "")
+        + "]"
+    )
+    if rate > thr:
+        return _leakage_result(
+            0.0,
+            False,
+            f"contamination detected (masked-option EM={rate:.3f} > threshold={thr:.3f}) {suffix}",
+        )
+    return _leakage_result(
+        1.0,
+        True,
+        f"no contamination (masked-option EM={rate:.3f} <= threshold={thr:.3f}) {suffix}",
+    )
+
+
 def eval_leakage_check(
     benchmark: str | None = None,
     lm=None,
     n: int = _LEAKAGE_DEFAULT_N,
-    threshold: float = _LEAKAGE_DEFAULT_THRESHOLD,
+    threshold: float | None = None,
     seed: int = _LEAKAGE_DEFAULT_SEED,
     items: list[dict] | None = None,
 ) -> dict:
-    """Training-data contamination gate (H4).
+    """Training-data contamination gate (H4) — measures verbatim recall.
 
-    Samples `n` benchmark items with a seeded rng, asks the model to recite each
-    item's gold answer from memory with no chain-of-thought, and measures the
-    exact-match rate against the stored answer key.
+    Samples `n` benchmark items with a seeded rng and dispatches on the
+    benchmark type to a memorization probe that is robust to chain-of-thought
+    and does NOT conflate answer correctness with contamination:
+
+      * open-ended (math500, aime-2024): guided-instruction quiz completion with
+        a WITH/WITHOUT dataset-context ROUGE-L baseline delta (Track A).
+      * multiple-choice (gpqa-diamond): TS-Guessing masked wrong-option
+        reconstruction, scored by normalized exact-match rate (Track B).
 
     Args:
-        benchmark: dataset selector (default "math500"). Ignored when `items`
-            is supplied.
+        benchmark: dataset selector (default "math500"). Also selects the track;
+            still honored when `items` is supplied (so tests can drive a track).
         lm: language model exposing `agenerate_single`/`generate`. When None,
-            one is constructed from the environment (ITS_ENDPOINT etc.).
-        n: number of items to probe (default 5).
-        threshold: exact-match rate strictly above which contamination is
-            declared (default 0.5). rate == threshold passes.
+            one is constructed from the environment (ITS_ENDPOINT etc.) and
+            closed before returning (no aiohttp session leak).
+        n: number of items to probe (default 10).
+        threshold: contamination cutoff. When None (default) the track-specific
+            default is used — 0.3 ROUGE-L delta for open-ended, 0.5 exact-match
+            rate for multiple-choice. A value strictly ABOVE the threshold means
+            contamination; a value == threshold passes.
         seed: seed for the reproducible item sample (default 0). The same seed
             always selects the same items.
         items: optional pre-loaded [{problem, answer, ...}] list, bypassing
             dataset loading (used by tests / advanced callers).
 
     Returns:
-        Standard eval dict. rate > threshold -> score=0.0, passed=False,
+        Standard eval dict. Contaminated -> score=0.0, passed=False,
         details="contamination detected (...)". Otherwise score=1.0,
-        passed=True with the measured rate. If the check cannot run (no items,
-        no reachable LM) it degrades to score=0.0, passed=False and NEVER raises.
+        passed=True. If the check cannot run (no items, no reachable LM,
+        nothing parseable) it degrades to score=0.0, passed=False and NEVER
+        raises.
     """
     import random
 
     benchmark = benchmark or _LEAKAGE_DEFAULT_BENCHMARK
+    track = _leakage_track_for(benchmark)
 
     # 1. Materialize the item pool (injected > loaded from the benchmark).
     if items is None:
@@ -633,6 +976,7 @@ def eval_leakage_check(
     sampled = [items[i] for i in sampled_idx]
 
     # 3. Resolve the LM (env-constructed when not injected).
+    constructed = lm is None
     if lm is None:
         lm = _leakage_construct_lm()
     if lm is None:
@@ -643,41 +987,15 @@ def eval_leakage_check(
             "(ITS_ENDPOINT)",
         )
 
-    # 4. Probe each item and count exact recitations of the gold answer.
-    matched = 0
-    errors = 0
-    for item in sampled:
-        try:
-            response = _leakage_call_lm(lm, _leakage_probe_prompt(item))
-        except Exception:
-            errors += 1
-            continue
-        if _leakage_exact_match(item["answer"], response):
-            matched += 1
-
-    probed = k - errors
-    if probed <= 0:
-        return _leakage_result(
-            0.0, False, f"leakage check could not run: all {k} probes errored"
-        )
-
-    rate = matched / probed
-    suffix = (
-        f"on {benchmark} [{matched}/{probed} items, n={n}, seed={seed}"
-        + (f", {errors} errored" if errors else "")
-        + "]"
-    )
-    if rate > threshold:
-        return _leakage_result(
-            0.0,
-            False,
-            f"contamination detected (rate={rate:.3f} > threshold={threshold:.3f}) {suffix}",
-        )
-    return _leakage_result(
-        1.0,
-        True,
-        f"no contamination (rate={rate:.3f} <= threshold={threshold:.3f}) {suffix}",
-    )
+    # 4. Dispatch to the track-appropriate memorization probe. Always close an
+    #    LM we constructed so no aiohttp client session is leaked.
+    try:
+        if track == "mc":
+            return _leakage_check_mc(lm, benchmark, sampled, n, threshold, seed)
+        return _leakage_check_open(lm, benchmark, sampled, n, threshold, seed)
+    finally:
+        if constructed:
+            _leakage_close_lm(lm)
 
 
 # Every eval dimension, keyed by name. `--dimension <name>` runs exactly one of
