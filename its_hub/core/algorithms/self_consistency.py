@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -47,6 +48,103 @@ __all__ = [
 # use case for the IaaS gateway). Pass tool_vote=None to force content-only
 # voting, which raises if every response is a tool call.
 DEFAULT_TOOL_VOTE = "tool_hierarchical"
+
+# --- Completion-status-aware selection (H1) + telemetry (H2), cycle-3 ----------
+# Both are OPT-IN and OFF by default so the scored path stays byte-identical to
+# baseline. Mirrors the ``ITS_SC_VOTE`` A/B pattern in ``_sc_voting.py``.
+#
+# Motivation: the dominant scored failure is CONTEXT_TRUNCATION -- the model
+# overruns the completion window and emits an unfinished, un-boxed essay. On the
+# many GPQA/AIME items where a *subset* of the samples actually finishes-and-boxes
+# while the rest truncate, the fixed answer extractor still lets the truncated
+# samples carry the vote (with a salvaged/partial answer). H1 restricts the vote
+# to the finished-and-boxed subset when such a proper subset exists, so the real,
+# completed answer carries the item. This is a purely STRUCTURAL signal (a real
+# ``\boxed{...}`` token present AND content length below a truncation cap); it
+# reads NO logprobs and is explicitly NOT the exp-11 confidence-weighting NULL.
+_COMPLETION_SELECT_ENV_VAR = "ITS_SC_COMPLETION_SELECT"
+_LOG_COMPLETION_ENV_VAR = "ITS_SC_LOG_COMPLETION"
+_TRUNC_CAP_ENV_VAR = "ITS_SC_TRUNC_CAP_CHARS"
+# Default truncation cap in characters. Chosen well ABOVE the completed-response
+# length distribution (finished boxed answers are far shorter) and well BELOW the
+# observed ~17.9k-20.7k-char truncation regime, so completed and truncated
+# samples separate cleanly and content-agnostically. DEV-tunable via the env var.
+_DEFAULT_TRUNC_CAP_CHARS = 8000
+
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _resolve_completion_select() -> bool:
+    """Whether completion-status-aware selection (H1) is enabled.
+
+    Reads ``ITS_SC_COMPLETION_SELECT`` fresh on every call. Any recognized truthy
+    value enables it; unset / anything else keeps the baseline behavior, so the
+    default scored path is byte-identical to today.
+    """
+    return (
+        os.environ.get(_COMPLETION_SELECT_ENV_VAR, "").strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
+
+
+def _resolve_log_completion() -> bool:
+    """Whether per-sample completion-status logging (H2) is enabled.
+
+    Enabled when either ``ITS_SC_COMPLETION_SELECT`` (so a selection A/B run is
+    always auditable) or the dedicated ``ITS_SC_LOG_COMPLETION`` gate is truthy.
+    Default OFF -> no log volume.
+    """
+    if _resolve_completion_select():
+        return True
+    return (
+        os.environ.get(_LOG_COMPLETION_ENV_VAR, "").strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
+
+
+def _resolve_trunc_cap() -> int:
+    """Read the truncation cap (chars) from ``ITS_SC_TRUNC_CAP_CHARS``.
+
+    Falls back to ``_DEFAULT_TRUNC_CAP_CHARS`` when unset, non-integer, or
+    non-positive so a malformed override can never disable the length guard.
+    """
+    raw = os.environ.get(_TRUNC_CAP_ENV_VAR)
+    if raw is None:
+        return _DEFAULT_TRUNC_CAP_CHARS
+    try:
+        val = int(raw.strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_TRUNC_CAP_CHARS
+    return val if val > 0 else _DEFAULT_TRUNC_CAP_CHARS
+
+
+def _has_real_boxed(content: str) -> bool:
+    """Whether ``content`` contains an actual, CLOSED ``\\boxed{...}`` token.
+
+    Structural completion marker: a salvaged mid-stream option letter (what the
+    fixed extractor falls back to on a truncated essay) has no ``\\boxed{`` token,
+    so this cleanly distinguishes a finished answer from a truncated one. We
+    require a brace-balanced close after ``\\boxed{`` so a box that was cut off
+    mid-emission by truncation (``...\\boxed{`` at end of stream) does NOT count
+    as completed. The last occurrence is scanned so trailing final answers win.
+    """
+    if not content:
+        return False
+    token = "\\boxed{"
+    start = content.rfind(token)
+    if start == -1:
+        return False
+    # Scan from the opening brace of the boxed token, tracking brace depth so
+    # nested LaTeX (e.g. \boxed{\frac{1}{2}}) is handled correctly.
+    depth = 0
+    for ch in content[start + len(token) - 1 :]:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return True
+    return False
 
 
 @dataclass
@@ -209,7 +307,116 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 eligible_indices = content_indices
                 projected = content_projected
 
+            # Completion-status refinement (H1), layered on the same
+            # "if proper-subset else full set" guard shape as above so the
+            # never-zero-candidate contract is preserved. Only active when
+            # ITS_SC_COMPLETION_SELECT is on; otherwise this is a no-op and the
+            # returned lists are byte-identical to the answer-bearing filter.
+            if _resolve_completion_select():
+                eligible_indices, projected = self._filter_completed(
+                    eligible_indices, projected, responses
+                )
+
         return eligible_indices, projected
+
+    @staticmethod
+    def _is_completed_response(response: dict, cap: int) -> bool:
+        """Structural per-response completion signal for H1.
+
+        ``completed = has_real_boxed(content) AND char_len(content) < cap``.
+        Reads the RAW response content (no logprobs, no ground truth): a real,
+        closed ``\\boxed{...}`` token present AND the content shorter than the
+        truncation cap. Both conditions are required so a box emitted early
+        followed by a truncated over-run is not mistaken for a finished answer.
+        """
+        content = extract_content_from_lm_response(response)
+        return _has_real_boxed(content) and len(content) < cap
+
+    def _filter_completed(
+        self,
+        eligible_indices: list[int],
+        projected: list,
+        responses: list[dict],
+    ) -> tuple[list[int], list]:
+        """Restrict the vote set to the finished-and-boxed subset when one exists.
+
+        Operates on the answer-bearing (eligible) content responses, keeping the
+        ``eligible_indices``/``projected`` lists positionally aligned so index
+        mapping stays correct through BOTH the flat and tuple/hierarchical
+        projection paths downstream. The restriction fires ONLY when a PROPER
+        SUBSET is completed (>=1 completed AND >=1 not completed):
+
+        - all-samples-complete -> subset == full set -> no filtering
+          (guarantee (a): byte-identical to baseline);
+        - all-samples-truncate -> completed subset empty -> keep the full set
+          (guarantee (b): degenerate to the current uniform fallback,
+          never zero candidates).
+        """
+        cap = _resolve_trunc_cap()
+        completed_mask = [
+            self._is_completed_response(responses[i], cap) for i in eligible_indices
+        ]
+        n_completed = sum(completed_mask)
+        if 0 < n_completed < len(eligible_indices):
+            eligible_indices = [
+                idx for idx, done in zip(eligible_indices, completed_mask) if done
+            ]
+            projected = [
+                proj for proj, done in zip(projected, completed_mask) if done
+            ]
+        return eligible_indices, projected
+
+    def _log_completion_status(
+        self, responses: list[dict], selected_index: int
+    ) -> None:
+        """Emit ONE compact structured record of the completion partition (H2).
+
+        Telemetry only -- makes the completed/truncated split H1 acts on auditable
+        from replay logs without re-running the GPU. Recomputes its own view of the
+        partition (it does not mutate any selection state) and logs at INFO under a
+        stable ``sc_completion_status`` event key for grep/JSON parsing.
+        """
+        cap = _resolve_trunc_cap()
+        per_sample = []
+        for r in responses:
+            content = extract_content_from_lm_response(r)
+            per_sample.append(
+                {"has_box": _has_real_boxed(content), "char_len": len(content)}
+            )
+
+        def _completed(entry: dict) -> bool:
+            return entry["has_box"] and entry["char_len"] < cap
+
+        n_samples = len(responses)
+        n_completed = sum(1 for entry in per_sample if _completed(entry))
+        n_truncated = n_samples - n_completed
+        # Empty-projection count on the content path (mirrors the answer-bearing
+        # eligibility filter) -- how many samples carry no votable answer at all.
+        n_empty_projection = sum(
+            1
+            for r in responses
+            if not r.get("tool_calls")
+            and self._is_empty_projection(
+                self.consistency_space_projection_func(
+                    extract_content_from_lm_response(r)
+                )
+            )
+        )
+        selected_completed = (
+            0 <= selected_index < n_samples and _completed(per_sample[selected_index])
+        )
+        record = {
+            "event": "sc_completion_status",
+            "n_samples": n_samples,
+            "n_completed": n_completed,
+            "n_truncated": n_truncated,
+            "n_empty_projection": n_empty_projection,
+            "selected_index": selected_index,
+            "selected_completed": selected_completed,
+            "cap_chars": cap,
+            "per_sample": per_sample,
+        }
+        logging.info("sc_completion_status %s", json.dumps(record))
 
     @staticmethod
     def _aggregate_logprob(response: dict) -> float | None:
@@ -331,6 +538,11 @@ class SelfConsistency(AbstractScalingAlgorithm):
 
         # Map back to original index
         selected_index = eligible_indices[filtered_selected_index]
+
+        # Per-sample completion-status telemetry (H2), gated OFF by default.
+        # Pure logging: selection is UNCHANGED by this block.
+        if _resolve_log_completion():
+            self._log_completion_status(responses, selected_index)
 
         # Return result with original responses preserved
         result = SelfConsistencyResult(
