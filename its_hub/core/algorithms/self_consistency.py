@@ -61,6 +61,23 @@ DEFAULT_TOOL_VOTE = "tool_hierarchical"
 # downstream processing are byte-identical to the baseline path.
 _ANSWER_FORCE_ENV_VAR = "ITS_SC_ANSWER_FORCE"
 
+# --- Tiered voting (H1, exp-16) ---------------------------------------------
+# Sub-flag gating natural-first / forced-fallback aggregation on top of the
+# answer-forcing path. Forced continuations on multi-step numeric items are
+# low-budget guesses that dilute a correct natural-stop minority
+# (FORCED_ANSWER_DILUTION); when a NATURAL boxed candidate exists, the FORCED
+# samples are gated out of the plurality and consulted only as a fallback when
+# no natural candidate survives (preserving the all-empty GPQA rescue). Resolved
+# at the same call site as forcing so a single env var flips the vote-time gate
+# with NO code edits and NO LM request-shape change (pure post-hoc selection
+# over already-cached responses -> replay-verifiable off the warm cache).
+# Default: OFF -- explicit opt-in only. Tiering is active ONLY when
+# ``ITS_SC_TIER_VOTING`` is explicitly truthy; when it is unset (even with
+# answer-forcing ON) tiering stays OFF and the exp-15 behavior is preserved
+# byte-for-byte. Promoting tiering to default-ON is deferred because it would
+# supersede an exp-15 tie test (Sacred Rule 1 forbids editing existing tests).
+_TIER_VOTING_ENV_VAR = "ITS_SC_TIER_VOTING"
+
 # Main-generation cap when forcing is ON: reserves headroom below the ~3.9k
 # completion window (4096 context - prompt) so the forced continuation fits
 # before the hard cap (s1, arXiv:2501.19393).
@@ -98,6 +115,21 @@ def _resolve_answer_force() -> bool:
     returns ``False`` so the baseline decode path is byte-identical.
     """
     val = os.environ.get(_ANSWER_FORCE_ENV_VAR, "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _resolve_tier_voting() -> bool:
+    """Whether tiered (natural-first) voting is enabled via ``ITS_SC_TIER_VOTING``.
+
+    Default OFF -- explicit opt-in only. Tiering is active ONLY when the sub-flag
+    is explicitly truthy (``1``/``true``/``yes``/``on``, case-insensitive). When
+    the flag is UNSET -- even with ``ITS_SC_ANSWER_FORCE`` active -- tiering stays
+    OFF, so the forced samples are voted alongside the natural ones exactly as in
+    exp-15 (the existing exp-15 tie test is preserved byte-for-byte). An explicit
+    ``ITS_SC_TIER_VOTING=0`` is the control arm and is likewise OFF; any value
+    outside the truthy set (empty, ``0``, ``off``, garbage) returns ``False``.
+    """
+    val = os.environ.get(_TIER_VOTING_ENV_VAR, "").strip().lower()
     return val in {"1", "true", "yes", "on"}
 
 
@@ -308,6 +340,12 @@ class SelfConsistency(AbstractScalingAlgorithm):
             forced = dict(response)
             forced["content"] = completed
             forced["_logprobs"] = None
+            # Structural marker consumed by tiered voting (H1, exp-16). This is
+            # the reliable "completed by a synthetic continuation" signal (archive
+            # #335: forced logprobs are meaningless for ranking); the vote-time
+            # gate in ``_project_responses`` uses it to keep forced guesses out of
+            # the plurality whenever a natural boxed candidate exists.
+            forced["_forced"] = True
             responses[i] = forced
 
         if n_forced:
@@ -377,7 +415,61 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 eligible_indices = content_indices
                 projected = content_projected
 
+            # Tiered voting gate (H1, exp-16). When active, partition the eligible
+            # set into NATURAL (samples that emitted a terminal answer on their
+            # own) vs FORCED (completed by a synthetic ``_forced`` continuation).
+            # If a NATURAL candidate exists AND >=1 forced sample is present, drop
+            # the forced samples so plurality runs natural-first; otherwise leave
+            # the eligible set UNCHANGED (forced-fallback for the all-empty rescue
+            # case). Tiering is default-OFF opt-in, so when ``ITS_SC_TIER_VOTING``
+            # is unset (or ``0``) this whole block is skipped and eligible_indices
+            # is returned unchanged -- the exp-15 and flag-OFF paths are preserved
+            # byte-for-byte. Even when enabled, gating on the presence of a forced
+            # sample keeps it a strict no-op when no forced samples exist.
+            if _resolve_tier_voting():
+                natural = [
+                    (idx, proj)
+                    for idx, proj in zip(eligible_indices, projected)
+                    if not responses[idx].get("_forced")
+                ]
+                forced_present = any(
+                    responses[idx].get("_forced") for idx in eligible_indices
+                )
+                if natural and forced_present:
+                    eligible_indices = [idx for idx, _ in natural]
+                    projected = [proj for _, proj in natural]
+
         return eligible_indices, projected
+
+    def _tier_stats(self, responses: list[dict]) -> tuple[int, int, bool]:
+        """Tier telemetry over the content-path eligible set (H1, exp-16).
+
+        Returns ``(n_natural, n_forced, tier_fired)`` computed on the SAME
+        eligible set the tiering gate in ``_project_responses`` sees (the
+        non-empty content projections, or the full content set as fallback). This
+        mirrors that logic so the reported counts describe the pre-gate partition;
+        it is observability only and has NO behavioral effect. Returns all-zero /
+        ``False`` on the tool-vote path (tiering never applies there).
+        """
+        if self._is_tool_vote_path(responses):
+            return (0, 0, False)
+        content_indices = [i for i, r in enumerate(responses) if not r.get("tool_calls")]
+        content_projected = [
+            self.consistency_space_projection_func(
+                extract_content_from_lm_response(responses[i])
+            )
+            for i in content_indices
+        ]
+        non_empty = [
+            idx
+            for idx, proj in zip(content_indices, content_projected)
+            if not self._is_empty_projection(proj)
+        ]
+        eligible = non_empty if non_empty else content_indices
+        n_forced = sum(1 for idx in eligible if responses[idx].get("_forced"))
+        n_natural = len(eligible) - n_forced
+        tier_fired = n_natural > 0 and n_forced > 0
+        return (n_natural, n_forced, tier_fired)
 
     @staticmethod
     def _aggregate_logprob(response: dict) -> float | None:
@@ -442,6 +534,20 @@ class SelfConsistency(AbstractScalingAlgorithm):
             )
 
         eligible_indices, responses_projected = self._project_responses(responses)
+
+        # Tier telemetry (H1, exp-16): observability only, NO behavioral effect.
+        # Emitted whenever tiered voting is active so the natural/forced split and
+        # whether the natural-first gate fired are visible in logs for the A/B.
+        if _resolve_tier_voting():
+            n_natural, n_forced, tier_fired = self._tier_stats(responses)
+            logging.info(
+                "SelfConsistency tiered voting: n_natural=%d n_forced=%d "
+                "tier_fired=%s out of %d samples",
+                n_natural,
+                n_forced,
+                tier_fired,
+                len(responses),
+            )
 
         # Formatting-invariant vote keys for COUNTING only: on the content path,
         # group answers that differ merely in presentation (e.g. \boxed{\text{C}}
