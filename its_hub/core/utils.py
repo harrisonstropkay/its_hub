@@ -5,8 +5,19 @@ import warnings
 # the system prompt for step-by-step reasoning taken from https://github.com/huggingface/search-and-learn
 SAL_STEP_BY_STEP_SYSTEM_PROMPT = "Solve the following math problem efficiently and clearly:\n\n- For simple problems (2 steps or fewer):\nProvide a concise solution with minimal explanation.\n\n- For complex problems (3 steps or more):\nUse this step-by-step format:\n\n## Step 1: [Concise description]\n[Brief explanation and calculations]\n\n## Step 2: [Concise description]\n[Brief explanation and calculations]\n\n...\n\nRegardless of the approach, always conclude with:\n\nTherefore, the final answer is: $\\boxed{answer}$. I hope it is correct.\n\nWhere [answer] is just the final number or expression that solves the problem."
 
+# Quantitative token-budget prompt grounded in TALE (Token-Budget-Aware LLM
+# Reasoning, arXiv:2412.18547): giving the model an explicit *numeric* reasoning
+# ceiling compresses chain-of-thought (~67% fewer tokens, <5% accuracy loss)
+# without the repetition-collapse that a qualitative "be concise" directive
+# triggers on Qwen2.5-Math. The ~1024-token ceiling sits materially below the
+# ~3.9k completion window so the model emits a terminal \boxed{} before the cut,
+# and the \boxed{} convention is preserved exactly for the fixed extractors.
 QWEN_SYSTEM_PROMPT = (
-    "Please reason step by step, and put your final answer within \\boxed{}."
+    "Please reason step by step, but keep your reasoning brief: use fewer than "
+    "1024 tokens of reasoning, and reach your final answer early rather than "
+    "exploring at length. Always finish your response with the final answer "
+    "inside \\boxed{} — a number or expression for math problems, or a single "
+    "letter A, B, C, or D for multiple-choice questions."
 )
 
 
