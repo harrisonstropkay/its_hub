@@ -9,6 +9,20 @@ QWEN_SYSTEM_PROMPT = (
     "Please reason step by step, and put your final answer within \\boxed{}."
 )
 
+# --- Answer/budget forcing continuation strings (H1, ITS_SC_ANSWER_FORCE) -----
+# Appended to the ASSISTANT turn to force a terminal ``\boxed{}`` on samples that
+# exhausted the context window before emitting one. This is a CONTINUATION STRING
+# on the assistant turn -- it is explicitly NOT a ``QWEN_SYSTEM_PROMPT`` rewrite
+# and touches no system prompt (distinguishing it from the refuted exp-1/exp-13
+# system-prompt brevity lever). Paired with ``stop="}"`` so the closing brace
+# terminates the forced answer cleanly.
+CONTINUATION_PRIMER = "\n\nFinal answer: \\boxed{"
+# MCQ/GPQA-shaped items force a single option letter. The primer string is the
+# same as the numeric one -- only the continuation token budget differs (tighter
+# for MCQ, set at the call site) -- but a distinct named constant keeps the MCQ
+# path explicit and independently tunable.
+CONTINUATION_PRIMER_MCQ = "\n\nFinal answer: \\boxed{"
+
 
 def resolve_max_completion_tokens(
     max_completion_tokens: int | None,

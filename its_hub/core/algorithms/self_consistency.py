@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -24,6 +25,8 @@ from its_hub.core.algorithms._sc_voting import (
 )
 from its_hub.core.orchestrator import LMOrchestrator
 from its_hub.core.utils import (
+    CONTINUATION_PRIMER,
+    CONTINUATION_PRIMER_MCQ,
     _canonicalize_vote_key,
     extract_content_from_lm_response,
 )
@@ -47,6 +50,72 @@ __all__ = [
 # use case for the IaaS gateway). Pass tool_vote=None to force content-only
 # voting, which raises if every response is a tool call.
 DEFAULT_TOOL_VOTE = "tool_hierarchical"
+
+# --- Answer/budget forcing (H1, exp-15) -------------------------------------
+# Default-OFF decode mode gated on ``ITS_SC_ANSWER_FORCE``. When ON it caps the
+# main generation below the context window and issues ONE short forced
+# continuation for any sample that never emitted a terminal ``\boxed{}`` answer,
+# attacking the dominant CONTEXT_TRUNCATION failure. Resolved at the ``ainfer``
+# call site (mirroring ``ITS_SC_VOTE``) so a single env var flips the branch with
+# NO code edits between A/B runs. With the flag unset the generation call and ALL
+# downstream processing are byte-identical to the baseline path.
+_ANSWER_FORCE_ENV_VAR = "ITS_SC_ANSWER_FORCE"
+
+# Main-generation cap when forcing is ON: reserves headroom below the ~3.9k
+# completion window (4096 context - prompt) so the forced continuation fits
+# before the hard cap (s1, arXiv:2501.19393).
+_ANSWER_FORCE_MAIN_MAX_TOKENS = 3600
+# Short continuation budgets. Numeric (MATH/AIME) answers need room for a short
+# expression; MCQ/GPQA answers are a single letter, so a tighter cap physically
+# prevents verbose completions. Ambiguous item shapes default to the numeric
+# (wider) budget so a numeric answer is never under-budgeted.
+_ANSWER_FORCE_CONT_MAX_TOKENS_NUMERIC = 48
+_ANSWER_FORCE_CONT_MAX_TOKENS_MCQ = 16
+# Stop string terminating the forced ``\boxed{...}``. Relies on vLLM's default
+# ``include_stop_str_in_output=False`` so the closing brace is not echoed back
+# (we re-append it when reconstructing the completed text).
+_ANSWER_FORCE_STOP = "}"
+
+# A completed ``\boxed{...}`` answer: opening brace, a non-empty body, and a
+# closing brace. Presence means the sample carries a real terminal answer;
+# absence (a truncated ``\boxed{`` with no close, or no box at all) triggers
+# forcing. This is the same ``\boxed`` notion the projection relies on for
+# vote-key extraction.
+_BOXED_RE = re.compile(r"\\boxed\{.+?\}", re.DOTALL)
+# Decorated option-letter markers (A-D) as they appear in MCQ/GPQA prompts:
+# ``A)`` ``(A)`` ``A.`` ``[A]``. Used to infer item shape from the prompt only,
+# without reading any dataset or benchmark code.
+_MCQ_OPTION_RE = re.compile(r"(?:^|\n|\s)[(\[]?\s*([A-D])\s*[).\]]", re.MULTILINE)
+# Minimum distinct decorated A-D letters required to treat an item as MCQ.
+_MCQ_MIN_DISTINCT_OPTIONS = 3
+
+
+def _resolve_answer_force() -> bool:
+    """Whether answer/budget forcing is enabled via ``ITS_SC_ANSWER_FORCE``.
+
+    Default OFF: only an explicit truthy value (``1``/``true``/``yes``/``on``,
+    case-insensitive) enables forcing. Unset, ``0``, empty, or any other value
+    returns ``False`` so the baseline decode path is byte-identical.
+    """
+    val = os.environ.get(_ANSWER_FORCE_ENV_VAR, "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _has_boxed_answer(content: str | None) -> bool:
+    """Whether text carries a completed ``\\boxed{...}`` answer."""
+    return bool(content) and _BOXED_RE.search(content) is not None
+
+
+def _looks_like_mcq(prompt_text: str | None) -> bool:
+    """Infer MCQ/GPQA item shape from the prompt's option-letter markers.
+
+    True when at least ``_MCQ_MIN_DISTINCT_OPTIONS`` distinct decorated letters
+    among A-D appear (e.g. ``A) ...`` ``(B) ...`` ``C. ...``). Deliberately
+    conservative: when the signal is ambiguous this returns ``False`` so the
+    caller uses the wider numeric continuation budget.
+    """
+    letters = {m.group(1).upper() for m in _MCQ_OPTION_RE.finditer(prompt_text or "")}
+    return len(letters) >= _MCQ_MIN_DISTINCT_OPTIONS
 
 
 @dataclass
@@ -141,17 +210,109 @@ class SelfConsistency(AbstractScalingAlgorithm):
         # break ties among equally-voted answer groups. Requesting logprobs is a
         # returned-metadata flag and does not alter sampling, so the vote outcome
         # for a clear majority is unaffected.
-        responses = await self.orchestrator.agenerate(
-            lm,
-            chat_messages.to_batch(budget),
-            tools=tools,
-            tool_choice=tool_choice,
-            usage_accumulator=usage,
-            logprobs=True,
-        )
+        #
+        # Answer/budget forcing (H1) is gated on ITS_SC_ANSWER_FORCE. When OFF
+        # (default) the generation call below and all downstream processing are
+        # byte-identical to baseline. When ON, the main generation is capped
+        # below the context window and box-absent samples get one short forced
+        # continuation before voting.
+        if _resolve_answer_force():
+            responses = await self.orchestrator.agenerate(
+                lm,
+                chat_messages.to_batch(budget),
+                tools=tools,
+                tool_choice=tool_choice,
+                usage_accumulator=usage,
+                logprobs=True,
+                max_tokens=_ANSWER_FORCE_MAIN_MAX_TOKENS,
+            )
+            responses = await self._force_box_absent_samples(
+                lm, chat_messages, responses, usage
+            )
+        else:
+            responses = await self.orchestrator.agenerate(
+                lm,
+                chat_messages.to_batch(budget),
+                tools=tools,
+                tool_choice=tool_choice,
+                usage_accumulator=usage,
+                logprobs=True,
+            )
 
         # process responses and return result
         return self._process_responses(responses, return_response_only, usage)
+
+    async def _force_box_absent_samples(
+        self,
+        lm: AbstractLanguageModel,
+        chat_messages: ChatMessages,
+        responses: list[dict],
+        usage: GenerationUsage | None,
+    ) -> list[dict]:
+        """Force a terminal ``\\boxed{}`` on every box-absent sample (H1).
+
+        For each sample lacking a completed ``\\boxed{...}``, issue ONE short
+        continuation appended to the assistant turn
+        (``draft + CONTINUATION_PRIMER``, ``stop="}"``) and splice
+        ``draft + primer + continuation + "}"`` back into the response so the
+        existing vote-key extraction picks up a real answer. Samples that already
+        carry a box (or are tool calls) are left untouched. Emits
+        ``n_forced``/``n_still_truncated`` telemetry via ``logging``.
+        """
+        original_messages = chat_messages.to_chat_messages()
+        is_mcq = _looks_like_mcq(chat_messages.to_prompt())
+        primer = CONTINUATION_PRIMER_MCQ if is_mcq else CONTINUATION_PRIMER
+        cont_max_tokens = (
+            _ANSWER_FORCE_CONT_MAX_TOKENS_MCQ
+            if is_mcq
+            else _ANSWER_FORCE_CONT_MAX_TOKENS_NUMERIC
+        )
+
+        n_forced = 0
+        n_still_truncated = 0
+        for i, response in enumerate(responses):
+            # Tool-call responses vote via signatures, not \boxed{}; skip them.
+            if response.get("tool_calls"):
+                continue
+            draft = extract_content_from_lm_response(response)
+            if _has_boxed_answer(draft):
+                continue
+
+            n_forced += 1
+            cont_messages = [
+                *original_messages,
+                ChatMessage(role="assistant", content=draft + primer),
+            ]
+            cont_response = await lm.agenerate_single(
+                cont_messages,
+                stop=_ANSWER_FORCE_STOP,
+                max_completion_tokens=cont_max_tokens,
+                usage_accumulator=usage,
+            )
+            continuation = extract_content_from_lm_response(cont_response)
+            completed = draft + primer + continuation + _ANSWER_FORCE_STOP
+
+            # If the forced continuation produced an empty body, the sample still
+            # has no real answer (proxy for a continuation that itself truncated).
+            if not _has_boxed_answer(completed):
+                n_still_truncated += 1
+
+            # Preserve original metadata (e.g. _logprobs); override only content
+            # so downstream projection re-extracts the now-completed answer.
+            forced = dict(response)
+            forced["content"] = completed
+            responses[i] = forced
+
+        if n_forced:
+            logging.info(
+                "SelfConsistency answer-forcing: n_forced=%d n_still_truncated=%d "
+                "mcq=%s out of %d samples",
+                n_forced,
+                n_still_truncated,
+                is_mcq,
+                len(responses),
+            )
+        return responses
 
     def _is_tool_vote_path(self, responses: list[dict]) -> bool:
         """Whether voting routes through tool-call signatures (vs content).
