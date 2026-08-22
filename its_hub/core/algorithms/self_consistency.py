@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -47,6 +48,67 @@ __all__ = [
 # use case for the IaaS gateway). Pass tool_vote=None to force content-only
 # voting, which raises if every response is a tool call.
 DEFAULT_TOOL_VOTE = "tool_hierarchical"
+
+# A/B switch for a per-sample temperature ladder on the self-consistency
+# sampling path (H1). Default OFF: when ``ITS_SC_TEMP_LADDER`` is unset (or a
+# falsey value) ``_resolve_temp_ladder`` returns None and ``ainfer`` passes NO
+# ``temperature`` argument to ``orchestrator.agenerate`` -- yielding a
+# byte-identical request payload (openai_lm.py emits ``temperature`` only when
+# set), so the control arm replays the incumbent score exactly. When set, the
+# var may carry an explicit comma-separated ladder (e.g. "0.3,0.3,0.6,0.9"); a
+# bare truthy sentinel (e.g. "1"/"true") falls back to the default ladder below.
+# Mirrors the ITS_SC_VOTE / _resolve_vote_mode() pattern used for voting.
+_TEMP_LADDER_ENV_VAR = "ITS_SC_TEMP_LADDER"
+# Low-temp-heavy default (H1, exp-19): retuned from (0.3, 0.6, 0.9, 1.2). The
+# 0.3 rescue rung is duplicated for more truncation-loop rescue shots per item,
+# the high-churn 1.2 rung is dropped as a GPQA-churn source, and 0.6/0.9 are
+# retained for vote diversity. Cycled round-robin to budget by _resolve_temp_ladder.
+_DEFAULT_TEMP_LADDER = (0.3, 0.3, 0.6, 0.9)
+
+
+def _resolve_temp_ladder(budget: int) -> list[float] | None:
+    """Resolve the per-sample temperature ladder from ``ITS_SC_TEMP_LADDER``.
+
+    Returns None when the flag is unset/empty/falsey so ``ainfer`` passes no
+    ``temperature`` argument (byte-identical control path). When enabled,
+    returns a ``list[float]`` of length ``budget``:
+
+    - An explicit comma-separated list (e.g. "0.3,0.3,0.6,0.9") is parsed;
+      non-numeric tokens are ignored.
+    - A bare truthy sentinel ("1"/"true"/"on"/"yes") with no explicit list falls
+      back to the default ladder ``(0.3, 0.3, 0.6, 0.9)``.
+    - Deterministic round-robin cycling: the resolved ladder is cycled to length
+      ``budget`` (``ladder[i % len(ladder)]``). With the default ladder
+      (0.3, 0.3, 0.6, 0.9): ``budget=4 -> [0.3, 0.3, 0.6, 0.9]``,
+      ``budget=8 -> [0.3, 0.3, 0.6, 0.9, 0.3, 0.3, 0.6, 0.9]``,
+      ``budget=1 -> [0.3]``, ``budget<=0 -> []``.
+    """
+    raw = os.environ.get(_TEMP_LADDER_ENV_VAR)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in {"0", "false", "off", "no"}:
+        return None
+    # A bare truthy sentinel means "enable with the default ladder"; an explicit
+    # comma-separated list overrides it. "1" is treated as a sentinel (not the
+    # single-value ladder [1.0]) per the H1 spec.
+    if raw.lower() in {"1", "true", "on", "yes"}:
+        ladder: list[float] = list(_DEFAULT_TEMP_LADDER)
+    else:
+        values: list[float] = []
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                values.append(float(tok))
+            except ValueError:
+                continue
+        ladder = values if values else list(_DEFAULT_TEMP_LADDER)
+    if budget <= 0:
+        return []
+    # Deterministic round-robin: cycle the resolved ladder to length ``budget``.
+    return [ladder[i % len(ladder)] for i in range(budget)]
 
 
 @dataclass
@@ -136,19 +198,40 @@ class SelfConsistency(AbstractScalingAlgorithm):
 
         usage = GenerationUsage()
 
+        # Per-sample temperature ladder A/B switch (H1). Resolved once here at the
+        # call site (mirrors _resolve_vote_mode() at the selection site). OFF
+        # (default) => None => the agenerate call below is byte-for-byte identical
+        # to today (no temperature argument => no temperature field in the payload
+        # => the control arm replays the incumbent score exactly). ON => a
+        # list[float] of length ``budget`` threaded via the already-plumbed
+        # ``temperature`` kwarg (orchestrator.agenerate -> agenerate_single ->
+        # _prepare_request_data). No other behavior changes.
+        temp_ladder = _resolve_temp_ladder(budget)
+
         # generate responses. logprobs=True is requested so the confidence
         # tie-break (see _process_responses) has per-token log probabilities to
         # break ties among equally-voted answer groups. Requesting logprobs is a
         # returned-metadata flag and does not alter sampling, so the vote outcome
         # for a clear majority is unaffected.
-        responses = await self.orchestrator.agenerate(
-            lm,
-            chat_messages.to_batch(budget),
-            tools=tools,
-            tool_choice=tool_choice,
-            usage_accumulator=usage,
-            logprobs=True,
-        )
+        if temp_ladder is None:
+            responses = await self.orchestrator.agenerate(
+                lm,
+                chat_messages.to_batch(budget),
+                tools=tools,
+                tool_choice=tool_choice,
+                usage_accumulator=usage,
+                logprobs=True,
+            )
+        else:
+            responses = await self.orchestrator.agenerate(
+                lm,
+                chat_messages.to_batch(budget),
+                tools=tools,
+                tool_choice=tool_choice,
+                usage_accumulator=usage,
+                logprobs=True,
+                temperature=temp_ladder,
+            )
 
         # process responses and return result
         return self._process_responses(responses, return_response_only, usage)
