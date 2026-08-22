@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import math
@@ -64,6 +65,18 @@ _TEMP_LADDER_ENV_VAR = "ITS_SC_TEMP_LADDER"
 # the high-churn 1.2 rung is dropped as a GPQA-churn source, and 0.6/0.9 are
 # retained for vote diversity. Cycled round-robin to budget by _resolve_temp_ladder.
 _DEFAULT_TEMP_LADDER = (0.3, 0.3, 0.6, 0.9)
+
+# C1 per-sample draw logging (H1, exp-20). When ``ITS_SC_DEBUG_SAMPLES`` names a
+# directory, ``_process_responses`` persists ALL K per-sample draws + their
+# ``_aggregate_logprob`` values + the vote keys/mode + the resolved
+# ``selected_index`` to one JSON file per item under that directory. Purely
+# additive diagnostic side-effect: it never reads back into the selection path,
+# never raises into the SC path (all failures are swallowed), and writes NOTHING
+# when the var is unset -- so the returned winner and selection ordering/tiebreaks
+# stay byte-identical to today. Mirrors the ITS_SC_VOTE / ITS_SC_TEMP_LADDER
+# env-var convention. Unblocks pass@k oracle-vs-vote sizing and turns every
+# future aggregation run into a zero-GPU cache replay.
+_DEBUG_SAMPLES_ENV_VAR = "ITS_SC_DEBUG_SAMPLES"
 
 
 def _resolve_temp_ladder(budget: int) -> list[float] | None:
@@ -415,6 +428,17 @@ class SelfConsistency(AbstractScalingAlgorithm):
         # Map back to original index
         selected_index = eligible_indices[filtered_selected_index]
 
+        # C1 (H1, exp-20): guarded per-sample draw+logprob logging. Additive,
+        # fail-safe, no-op unless ITS_SC_DEBUG_SAMPLES is set -- never perturbs
+        # the winner or selection ordering resolved above.
+        self._maybe_dump_debug_samples(
+            responses=responses,
+            eligible_indices=eligible_indices,
+            vote_keys=vote_keys,
+            vote_mode=vote_mode,
+            selected_index=selected_index,
+        )
+
         # Return result with original responses preserved
         result = SelfConsistencyResult(
             responses=responses,  # ALL original responses
@@ -423,6 +447,71 @@ class SelfConsistency(AbstractScalingAlgorithm):
             usage=usage,
         )
         return result.the_one if return_response_only else result
+
+    @classmethod
+    def _maybe_dump_debug_samples(
+        cls,
+        responses: list[dict],
+        eligible_indices: list[int],
+        vote_keys: list,
+        vote_mode: str,
+        selected_index: int,
+    ) -> str | None:
+        """Persist all K per-sample draws + logprobs + vote metadata (C1, H1).
+
+        No-op unless ``ITS_SC_DEBUG_SAMPLES`` names a directory. The write is a
+        pure diagnostic side-effect that never feeds back into selection and is
+        wrapped so that ANY failure (unwritable dir, serialization error, etc.)
+        is swallowed rather than raised into the self-consistency path -- so the
+        clear-winner path stays byte-identical whether or not logging succeeds.
+
+        Persists, per item: every draw's extracted content + ``_aggregate_logprob``
+        (aligned to ``responses`` by index), the ``vote_keys`` with the
+        ``eligible_indices`` they align to, the resolved ``vote_mode`` and the
+        ``selected_index``. The filename is a deterministic content hash of the
+        draws so a re-run of the same item overwrites (never crashes on a missing
+        item id). Returns the written path, or None when logging is off/failed.
+        """
+        debug_dir = os.environ.get(_DEBUG_SAMPLES_ENV_VAR)
+        if not debug_dir or not debug_dir.strip():
+            return None
+        try:
+            draws = [
+                {
+                    "index": i,
+                    "content": extract_content_from_lm_response(resp),
+                    "aggregate_logprob": cls._aggregate_logprob(resp),
+                    "has_tool_calls": bool(resp.get("tool_calls")),
+                }
+                for i, resp in enumerate(responses)
+            ]
+            payload = {
+                "num_draws": len(responses),
+                "draws": draws,
+                "eligible_indices": list(eligible_indices),
+                "vote_keys": [str(k) for k in vote_keys],
+                "vote_mode": vote_mode,
+                "selected_index": selected_index,
+            }
+            serialized = json.dumps(payload, ensure_ascii=False, default=str)
+            # Deterministic, item-id-free filename: hash the draw contents (plus
+            # vote keys to reduce cross-item collisions). Same item -> same file.
+            digest_src = "␟".join(
+                [str(d["content"]) for d in draws] + [str(k) for k in vote_keys]
+            )
+            item_id = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()[:16]
+            os.makedirs(debug_dir.strip(), exist_ok=True)
+            out_path = os.path.join(debug_dir.strip(), f"{item_id}_samples.json")
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(serialized)
+            return out_path
+        except Exception:
+            # Diagnostic side-effect must never raise into the SC path.
+            logging.debug(
+                "ITS_SC_DEBUG_SAMPLES logging failed; continuing without it",
+                exc_info=True,
+            )
+            return None
 
     @staticmethod
     def _make_hashable(obj):
