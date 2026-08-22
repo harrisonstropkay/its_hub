@@ -297,10 +297,17 @@ class SelfConsistency(AbstractScalingAlgorithm):
             if not _has_boxed_answer(completed):
                 n_still_truncated += 1
 
-            # Preserve original metadata (e.g. _logprobs); override only content
-            # so downstream projection re-extracts the now-completed answer.
+            # Override content so downstream projection re-extracts the
+            # now-completed answer. The draft's ``_logprobs`` describe the
+            # TRUNCATED draft tokens, not the forced final answer, so they carry
+            # no valid confidence for the voted content -- null them out. This
+            # makes ``_aggregate_logprob`` return None for the forced sample so
+            # it is excluded from the confidence tie-break (ties among forced
+            # samples fall back to the existing seeded-random selection). This is
+            # pure metadata handling: no LM request parameter changes.
             forced = dict(response)
             forced["content"] = completed
+            forced["_logprobs"] = None
             responses[i] = forced
 
         if n_forced:

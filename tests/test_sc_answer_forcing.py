@@ -17,9 +17,16 @@ that never emitted a terminal answer:
 New tests only -- no existing tests are modified.
 """
 
+import logging
+
 import pytest
 
-from its_hub.api import AbstractLanguageModel, AbstractOrchestrator
+from its_hub.api import (
+    AbstractLanguageModel,
+    AbstractOrchestrator,
+    ChatMessages,
+    GenerationUsage,
+)
 from its_hub.core.algorithms.self_consistency import (
     _ANSWER_FORCE_CONT_MAX_TOKENS_MCQ,
     _ANSWER_FORCE_CONT_MAX_TOKENS_NUMERIC,
@@ -259,3 +266,122 @@ class TestFlagOnForcing:
         assert lm.single_calls[0]["max_completion_tokens"] == (
             _ANSWER_FORCE_CONT_MAX_TOKENS_MCQ
         )
+
+
+# ---------------------------------------------------------------------------
+# Flag ON: stale-logprob correctness on forced samples
+# ---------------------------------------------------------------------------
+
+
+def _logprobs(mean: float) -> dict:
+    """OpenAI-format ``_logprobs`` payload with a single token of ``mean``."""
+    return {"content": [{"logprob": mean}]}
+
+
+class TestForcedSampleLogprobsNulled:
+    """A forced sample's stale draft ``_logprobs`` must not resolve a vote tie.
+
+    ``_force_box_absent_samples`` overrides only ``content`` on a forced sample;
+    its ``_logprobs`` still describe the TRUNCATED draft, not the forced final
+    answer. Left in place, ``_aggregate_logprob`` would compute a confidence over
+    the wrong tokens and ``_process_responses`` could let a forced sample win a
+    tie on that stale confidence. The fix nulls ``_logprobs`` on forced samples.
+    """
+
+    @pytest.mark.asyncio
+    async def test_forced_sample_logprobs_are_nulled(self, monkeypatch):
+        monkeypatch.setenv("ITS_SC_ANSWER_FORCE", "1")
+        # A single box-absent sample carrying a (high) draft confidence.
+        boxless = {**BOXLESS, "_logprobs": _logprobs(-0.01)}
+        orch = RecordingOrchestrator([dict(boxless)])
+        lm = ContinuationMockLM(continuation="9")
+        sc = SelfConsistency(orchestrator=orch)
+
+        result = await sc.ainfer(
+            lm, "What is 2 + 2?", budget=1, return_response_only=False
+        )
+
+        forced = result.responses[0]
+        # Content was completed into a real boxed answer...
+        assert _has_boxed_answer(forced["content"])
+        # ...but the stale draft logprobs are gone, so aggregate confidence is
+        # None and the forced sample is excluded from the tie-break.
+        assert forced["_logprobs"] is None
+        assert SelfConsistency._aggregate_logprob(forced) is None
+
+    @pytest.mark.asyncio
+    async def test_forced_sample_does_not_win_tie_via_stale_confidence(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("ITS_SC_ANSWER_FORCE", "1")
+        # Response 0: a GENUINE boxed answer with a LOW draft confidence.
+        # Response 1: box-absent, but with a HIGH stale draft confidence that --
+        # if preserved -- would let it win the 1-1 tie on the tie-break.
+        genuine = {**BOXED, "_logprobs": _logprobs(-2.0)}  # \boxed{7}
+        stale_high = {**BOXLESS, "_logprobs": _logprobs(-0.01)}
+        orch = RecordingOrchestrator([dict(genuine), dict(stale_high)])
+        lm = ContinuationMockLM(continuation="9")  # forced -> \boxed{9}
+        sc = SelfConsistency(orchestrator=orch)
+
+        result = await sc.ainfer(
+            lm, "What is 2 + 2?", budget=2, return_response_only=False
+        )
+
+        # Two distinct answer groups (7 vs forced 9), a genuine 1-1 tie.
+        assert len(result.response_counts) == 2
+        assert set(result.response_counts.values()) == {1}
+        # The genuine boxed sample (index 0) wins the tie: the forced sample's
+        # stale high confidence was nulled and cannot resolve the tie.
+        assert result.selected_index == 0
+        assert "\\boxed{7}" in result.the_one["content"]
+
+
+# ---------------------------------------------------------------------------
+# Flag ON: empty-continuation and tool-call edge cases (direct helper tests)
+# ---------------------------------------------------------------------------
+
+
+class TestForcingEdgeCases:
+    @pytest.mark.asyncio
+    async def test_empty_continuation_stays_box_absent(self, monkeypatch, caplog):
+        monkeypatch.setenv("ITS_SC_ANSWER_FORCE", "1")
+        # Continuation yields no body -> completed text is "\boxed{}" (no answer).
+        orch = RecordingOrchestrator([dict(BOXLESS)])
+        lm = ContinuationMockLM(continuation="")
+        sc = SelfConsistency(orchestrator=orch)
+
+        with caplog.at_level(logging.INFO):
+            result = await sc.ainfer(
+                lm, "What is 2 + 2?", budget=1, return_response_only=False
+            )
+
+        # The forced sample still has no real boxed answer.
+        assert not _has_boxed_answer(result.responses[0]["content"])
+        # Telemetry records the still-truncated sample.
+        assert "n_forced=1" in caplog.text
+        assert "n_still_truncated=1" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_tool_call_sample_is_left_untouched(self):
+        # Directly exercise the forcing helper so tool-call routing in voting
+        # does not obscure the "skip tool calls" behavior under test.
+        tool_response = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "lookup", "arguments": "{}"}}
+            ],
+        }
+        lm = ContinuationMockLM(continuation="9")
+        sc = SelfConsistency()
+        chat_messages = ChatMessages.from_prompt_or_messages("What is 2 + 2?")
+        usage = GenerationUsage()
+
+        forced = await sc._force_box_absent_samples(
+            lm, chat_messages, [dict(tool_response)], usage
+        )
+
+        # No continuation was issued for the tool-call sample...
+        assert lm.single_calls == []
+        # ...and it is returned byte-unchanged.
+        assert forced[0] == tool_response
