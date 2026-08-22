@@ -59,8 +59,10 @@ DEFAULT_TOOL_VOTE = "tool_hierarchical"
 # bare truthy sentinel (e.g. "1"/"true") falls back to the default ladder below.
 # Mirrors the ITS_SC_VOTE / _resolve_vote_mode() pattern used for voting.
 _TEMP_LADDER_ENV_VAR = "ITS_SC_TEMP_LADDER"
-# Low-temp-heavy default (H1, exp-19): the 0.3 rescue rung is duplicated (~50%
-# low) and the high-churn 1.2 rung is dropped; 0.6/0.9 stay for vote diversity.
+# Low-temp-heavy default (H1, exp-19): retuned from (0.3, 0.6, 0.9, 1.2). The
+# 0.3 rescue rung is duplicated for more truncation-loop rescue shots per item,
+# the high-churn 1.2 rung is dropped as a GPQA-churn source, and 0.6/0.9 are
+# retained for vote diversity. Cycled round-robin to budget by _resolve_temp_ladder.
 _DEFAULT_TEMP_LADDER = (0.3, 0.3, 0.6, 0.9)
 
 
@@ -75,16 +77,10 @@ def _resolve_temp_ladder(budget: int) -> list[float] | None:
       non-numeric tokens are ignored.
     - A bare truthy sentinel ("1"/"true"/"on"/"yes") with no explicit list falls
       back to the default ladder ``(0.3, 0.3, 0.6, 0.9)``.
-    - Front-loaded fractional allocation (H1, exp-19): the resolved ladder is NOT
-      round-robined. Instead ~50% of the samples (``n_low = max(1, budget // 2)``)
-      are pinned to the LOWEST rung ``ladder[0]`` and the remaining samples are
-      round-robined over the higher rungs. This keeps low-temp density
-      budget-INVARIANT (~50% at any budget) rather than pinned to the literal
-      ladder shape, because exp-18 confirmed every math flip came from the low
-      0.3 rung terminating truncation loops -- more 0.3 shots per item raise the
-      per-item rescue probability. With the default ladder (0.3, 0.3, 0.6, 0.9):
-      ``budget=4 -> [0.3, 0.3, 0.6, 0.9]``,
-      ``budget=8 -> [0.3, 0.3, 0.3, 0.3, 0.6, 0.9, 0.6, 0.9]``,
+    - Deterministic round-robin cycling: the resolved ladder is cycled to length
+      ``budget`` (``ladder[i % len(ladder)]``). With the default ladder
+      (0.3, 0.3, 0.6, 0.9): ``budget=4 -> [0.3, 0.3, 0.6, 0.9]``,
+      ``budget=8 -> [0.3, 0.3, 0.6, 0.9, 0.3, 0.3, 0.6, 0.9]``,
       ``budget=1 -> [0.3]``, ``budget<=0 -> []``.
     """
     raw = os.environ.get(_TEMP_LADDER_ENV_VAR)
@@ -111,25 +107,8 @@ def _resolve_temp_ladder(budget: int) -> list[float] | None:
         ladder = values if values else list(_DEFAULT_TEMP_LADDER)
     if budget <= 0:
         return []
-    # Front-loaded, budget-aware FRACTIONAL allocation (H1, exp-19). Pin ~50% of
-    # the samples to the LOWEST rung ``ladder[0]`` at ANY budget, then round-robin
-    # the residual samples over the higher rungs (the rungs above the lowest). The
-    # default ladder duplicates the low rung, so the higher rungs are the DISTINCT
-    # non-low temps (e.g. (0.3, 0.3, 0.6, 0.9) -> low=0.3, higher=[0.6, 0.9]); a
-    # bare ``ladder[1:]`` would leak a second 0.3 into the high block and dilute
-    # the intended low-temp-heavy shape. This makes low-temp density
-    # budget-invariant instead of shape-pinned; exp-18 showed the 0.3 rung is what
-    # rescues CONTEXT_TRUNCATION_UNRECOVERABLE loops, so more 0.3 shots per item
-    # raise the per-item rescue probability.
-    low = ladder[0]
-    higher = [t for t in ladder if t != low]
-    n_low = max(1, budget // 2)
-    if not higher:
-        # Single-rung (or all-equal) ladder: every sample uses the low rung.
-        return [low] * budget
-    allocation = [low] * n_low
-    allocation += [higher[i % len(higher)] for i in range(budget - n_low)]
-    return allocation
+    # Deterministic round-robin: cycle the resolved ladder to length ``budget``.
+    return [ladder[i % len(ladder)] for i in range(budget)]
 
 
 @dataclass
