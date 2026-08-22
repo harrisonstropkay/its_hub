@@ -71,6 +71,26 @@ _ANSWER_FORCE_MAIN_MAX_TOKENS = 3600
 # (wider) budget so a numeric answer is never under-budgeted.
 _ANSWER_FORCE_CONT_MAX_TOKENS_NUMERIC = 48
 _ANSWER_FORCE_CONT_MAX_TOKENS_MCQ = 16
+
+# --- Split-Budget / Decoupled Br·Ba (H1, exp-17) ----------------------------
+# Sub-flag gated on ``ITS_SC_SPLIT_BUDGET``, only meaningful when answer/budget
+# forcing is ALSO on (``ITS_SC_ANSWER_FORCE``). Re-tunes the NUMERIC arm of the
+# two-pass forcing into a proper decoupled reasoning/answer split: lower the
+# main-generation reasoning cap (Br) to reserve headroom, and widen the forced
+# answer-completion pass (Ba) so a box-absent numeric sample gets a real
+# finish-the-last-steps-and-box pass instead of a 48-token blind guess (the
+# coupling tax, arXiv:2605.07686). Second-call context stays legal:
+# prompt(~300) + draft(<=Br=3200) + primer + Ba(500) ~= 4020 < 4096. The MCQ
+# arm is UNTOUCHED so the all-empty forced-fallback GPQA rescue is preserved by
+# construction. Default OFF: when unset the numeric budgets are byte-identical
+# to exp-15 (Br=3600, Ba=48).
+_SPLIT_BUDGET_ENV_VAR = "ITS_SC_SPLIT_BUDGET"
+# Numeric reasoning cap (Br) when split-budget is ON: lowered from 3600 to fund
+# the wider answer pass while keeping the second call inside the 4096 window.
+_SPLIT_BUDGET_MAIN_MAX_TOKENS_NUMERIC = 3200
+# Numeric answer-completion pass (Ba) when split-budget is ON: widened from 48
+# so a near-complete numeric derivation can actually finish and box.
+_SPLIT_BUDGET_CONT_MAX_TOKENS_NUMERIC = 500
 # Stop string terminating the forced ``\boxed{...}``. Relies on vLLM's default
 # ``include_stop_str_in_output=False`` so the closing brace is not echoed back
 # (we re-append it when reconstructing the completed text).
@@ -98,6 +118,19 @@ def _resolve_answer_force() -> bool:
     returns ``False`` so the baseline decode path is byte-identical.
     """
     val = os.environ.get(_ANSWER_FORCE_ENV_VAR, "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _resolve_split_budget() -> bool:
+    """Whether the decoupled Br/Ba split is enabled via ``ITS_SC_SPLIT_BUDGET``.
+
+    Default OFF: only an explicit truthy value (``1``/``true``/``yes``/``on``,
+    case-insensitive) enables the split. Unset, ``0``, empty, or any other value
+    returns ``False`` so the numeric decode budgets are byte-identical to exp-15
+    (Br=3600, Ba=48). Only consulted on the numeric forcing branch when answer
+    forcing is also on, so it is dead code on every other path.
+    """
+    val = os.environ.get(_SPLIT_BUDGET_ENV_VAR, "").strip().lower()
     return val in {"1", "true", "yes", "on"}
 
 
@@ -217,6 +250,19 @@ class SelfConsistency(AbstractScalingAlgorithm):
         # below the context window and box-absent samples get one short forced
         # continuation before voting.
         if _resolve_answer_force():
+            # Compute item shape ONCE from the prompt so the main-gen cap and the
+            # forced continuation stay consistent. Split-budget (H1, exp-17) only
+            # re-tunes the NUMERIC arm: when the sub-flag is on and the item is
+            # not MCQ, lower the reasoning cap (Br) to fund a wider answer pass.
+            # MCQ items and split-budget-OFF keep _ANSWER_FORCE_MAIN_MAX_TOKENS
+            # (byte-identical to exp-15).
+            is_mcq = _looks_like_mcq(chat_messages.to_prompt())
+            split_budget = _resolve_split_budget()
+            main_max = (
+                _SPLIT_BUDGET_MAIN_MAX_TOKENS_NUMERIC
+                if (split_budget and not is_mcq)
+                else _ANSWER_FORCE_MAIN_MAX_TOKENS
+            )
             responses = await self.orchestrator.agenerate(
                 lm,
                 chat_messages.to_batch(budget),
@@ -224,10 +270,10 @@ class SelfConsistency(AbstractScalingAlgorithm):
                 tool_choice=tool_choice,
                 usage_accumulator=usage,
                 logprobs=True,
-                max_tokens=_ANSWER_FORCE_MAIN_MAX_TOKENS,
+                max_tokens=main_max,
             )
             responses = await self._force_box_absent_samples(
-                lm, chat_messages, responses, usage
+                lm, chat_messages, responses, usage, is_mcq, split_budget
             )
         else:
             responses = await self.orchestrator.agenerate(
@@ -248,6 +294,8 @@ class SelfConsistency(AbstractScalingAlgorithm):
         chat_messages: ChatMessages,
         responses: list[dict],
         usage: GenerationUsage | None,
+        is_mcq: bool | None = None,
+        split_budget: bool = False,
     ) -> list[dict]:
         """Force a terminal ``\\boxed{}`` on every box-absent sample (H1).
 
@@ -256,20 +304,40 @@ class SelfConsistency(AbstractScalingAlgorithm):
         (``draft + CONTINUATION_PRIMER``, ``stop="}"``) and splice
         ``draft + primer + continuation + "}"`` back into the response so the
         existing vote-key extraction picks up a real answer. Samples that already
-        carry a box (or are tool calls) are left untouched. Emits
-        ``n_forced``/``n_still_truncated`` telemetry via ``logging``.
+        carry a box (or are tool calls) are left untouched.
+
+        ``is_mcq`` (item shape) is computed once by ``ainfer`` and passed in so
+        the continuation budget matches the main-gen cap; when omitted it is
+        recomputed here from the prompt (preserves the direct-call contract).
+        When ``split_budget`` is on AND the item is numeric, the answer-completion
+        pass (Ba) is widened to ``_SPLIT_BUDGET_CONT_MAX_TOKENS_NUMERIC`` (500);
+        otherwise the exp-15 numeric budget (48) is used. The MCQ arm (primer +
+        Ba=16) is byte-identical regardless of ``split_budget``. Emits
+        ``n_forced``/``n_still_truncated``/``n_completed_by_extraction`` and the
+        Br/Ba split telemetry via ``logging``.
         """
         original_messages = chat_messages.to_chat_messages()
-        is_mcq = _looks_like_mcq(chat_messages.to_prompt())
+        if is_mcq is None:
+            is_mcq = _looks_like_mcq(chat_messages.to_prompt())
         primer = CONTINUATION_PRIMER_MCQ if is_mcq else CONTINUATION_PRIMER
-        cont_max_tokens = (
-            _ANSWER_FORCE_CONT_MAX_TOKENS_MCQ
-            if is_mcq
-            else _ANSWER_FORCE_CONT_MAX_TOKENS_NUMERIC
+        if is_mcq:
+            cont_max_tokens = _ANSWER_FORCE_CONT_MAX_TOKENS_MCQ
+        elif split_budget:
+            cont_max_tokens = _SPLIT_BUDGET_CONT_MAX_TOKENS_NUMERIC
+        else:
+            cont_max_tokens = _ANSWER_FORCE_CONT_MAX_TOKENS_NUMERIC
+        # Br: the main-gen reasoning cap actually used for this item shape (for
+        # telemetry only; the main call was already issued in ``ainfer``).
+        main_max_tokens = (
+            _SPLIT_BUDGET_MAIN_MAX_TOKENS_NUMERIC
+            if (split_budget and not is_mcq)
+            else _ANSWER_FORCE_MAIN_MAX_TOKENS
         )
 
         n_forced = 0
         n_still_truncated = 0
+        # box-absent draft -> box-present after the forced continuation.
+        n_completed_by_extraction = 0
         for i, response in enumerate(responses):
             # Tool-call responses vote via signatures, not \boxed{}; skip them.
             if response.get("tool_calls"):
@@ -294,8 +362,12 @@ class SelfConsistency(AbstractScalingAlgorithm):
 
             # If the forced continuation produced an empty body, the sample still
             # has no real answer (proxy for a continuation that itself truncated).
+            # Otherwise the continuation successfully turned a box-absent draft
+            # into a box-present answer.
             if not _has_boxed_answer(completed):
                 n_still_truncated += 1
+            else:
+                n_completed_by_extraction += 1
 
             # Override content so downstream projection re-extracts the
             # now-completed answer. The draft's ``_logprobs`` describe the
@@ -313,10 +385,15 @@ class SelfConsistency(AbstractScalingAlgorithm):
         if n_forced:
             logging.info(
                 "SelfConsistency answer-forcing: n_forced=%d n_still_truncated=%d "
-                "mcq=%s out of %d samples",
+                "n_completed_by_extraction=%d mcq=%s br=%d ba=%d split_budget=%s "
+                "out of %d samples",
                 n_forced,
                 n_still_truncated,
+                n_completed_by_extraction,
                 is_mcq,
+                main_max_tokens,
+                cont_max_tokens,
+                split_budget,
                 len(responses),
             )
         return responses
